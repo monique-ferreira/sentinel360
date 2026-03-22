@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
+import database # Importa o arquivo que criamos acima
 
 # Importe os motores que criamos antes
 # Certifique-se que scanner_engine.py e actions_manager.py estão na mesma pasta
@@ -43,25 +44,39 @@ async def start_scan(days: Optional[int] = 180, background_tasks: BackgroundTask
         raise HTTPException(status_code=400, detail="Varredura já em curso.")
     
     state.is_scanning = True
-    # Rodar em background para o Render não dar timeout na requisição HTTP
     background_tasks.add_task(run_and_store, days)
-    return {"message": "Varredura iniciada no servidor."}
+    return {"message": "Varredura iniciada. Os dados serão salvos no MongoDB."}
 
 def run_and_store(days):
     try:
-        state.results = scanner_engine.run_full_scan(days)
-        actions_manager.export_to_csv(state.results)
+        # 1. Roda o scanner
+        resultados = scanner_engine.run_full_scan(days)
+        # 2. Salva no MongoDB
+        database.save_scan_results(resultados)
     finally:
         state.is_scanning = False
 
 @app.get("/results")
 def get_results():
+    # Agora busca direto do banco de dados!
+    items = database.get_all_results()
     return {
         "is_scanning": state.is_scanning,
-        "count": len(state.results),
-        "items": state.results
+        "count": len(items),
+        "items": items
     }
 
+@app.delete("/delete-item")
+async def delete_item(path: str):
+    # Remove do disco (opcional) e do banco de dados
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        database.delete_specific_file(path)
+        return {"message": "Arquivo removido com sucesso."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 if __name__ == "__main__":
     # O Render exige que usemos a porta da variável de ambiente PORT
     port = int(os.environ.get("PORT", 8000))
