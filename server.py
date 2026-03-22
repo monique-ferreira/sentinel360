@@ -121,6 +121,10 @@ async def delete_item(path: str):
         return {"message": "Item removido com sucesso."}
     raise HTTPException(status_code=404, detail="Item não encontrado no banco.")
 
+@app.get("/ping")
+async def ping():
+    return {"status": "alive", "timestamp": time.time()}
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
