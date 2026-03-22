@@ -16,7 +16,10 @@ app = FastAPI(title="Sentinel 360 API")
 # Configuração de CORS para aceitar o seu Frontend (Vercel ou Local)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",  # Frontend local
+        "https://sentinel360-cyber.vercel.app"  # Frontend Vercel
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
