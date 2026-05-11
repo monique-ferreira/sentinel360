@@ -1,5 +1,5 @@
 """
-Sentinel360 – API Principal (v2)
+Sentinel360 â API Principal (v2)
 Multi-tenant | IA | Office 365 | Alertas
 """
 import os
@@ -59,7 +59,7 @@ class InviteUserRequest(BaseModel):
 
 @app.post("/auth/register")
 async def register(body: RegisterOrgRequest):
-    if await get_org_by_slug(body.org_slug): raise HTTPException(400, "Slug já em uso")
+    if await get_org_by_slug(body.org_slug): raise HTTPException(400, "Slug jÃ¡ em uso")
     org = await create_org({"name": body.org_name, "slug": body.org_slug, "plan": "free", "max_agents": 5, "max_users": 10, "created_at": datetime.utcnow(), "is_active": True})
     user = await create_user({"org_id": org["_id"], "email": body.email, "username": body.email.split("@")[0], "hashed_password": hash_password(body.password), "full_name": body.full_name, "role": "owner", "is_active": True, "created_at": datetime.utcnow()})
     token = create_access_token(user["_id"], org["_id"], "owner")
@@ -67,7 +67,10 @@ async def register(body: RegisterOrgRequest):
 
 @app.post("/auth/login")
 async def login(body: LoginRequest):
+    # Aceita login por username OU email
     user = await get_user_by_username(body.username)
+    if not user:
+        user = await get_user_by_email(body.username, None)
     if not user or not verify_password(body.password, user["hashed_password"]): raise HTTPException(401, "Credenciais inválidas")
     if not user.get("is_active"): raise HTTPException(403, "Conta desativada")
     await update_user_last_login(user["_id"])
@@ -83,7 +86,7 @@ async def get_organization(user=Depends(get_current_user)):
 
 @app.post("/org/invite")
 async def invite_user(body: InviteUserRequest, user=Depends(require_admin)):
-    if await get_user_by_username(body.username): raise HTTPException(400, "Username já em uso")
+    if await get_user_by_username(body.username): raise HTTPException(400, "Username jÃ¡ em uso")
     new_user = await create_user({"org_id": user.org_id, "email": body.email, "username": body.username, "hashed_password": hash_password(body.password), "role": body.role, "is_active": True, "created_at": datetime.utcnow()})
     new_user.pop("hashed_password", None)
     return new_user
@@ -168,7 +171,7 @@ async def configure_office365(body: Office365Config, user=Depends(require_admin)
 @app.get("/integrations/office365/audit")
 async def office365_audit(inactive_days: int = 90, user=Depends(require_analyst)):
     org = await get_org(user.org_id)
-    if not org.get("office365_tenant_id"): raise HTTPException(400, "Office 365 não configurado")
+    if not org.get("office365_tenant_id"): raise HTTPException(400, "Office 365 nÃ£o configurado")
     graph = GraphClient(org["office365_tenant_id"], org["office365_client_id"], org.get("office365_client_secret", ""))
     return await graph.full_audit(inactive_days=inactive_days)
 
