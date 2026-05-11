@@ -74,8 +74,11 @@ async def update_org(org_id: str, data: dict) -> bool:
 async def create_user(data: dict) -> dict:
     db = get_db(); result = await db.users.insert_one(data); data["_id"] = str(result.inserted_id); return data
 
-async def get_user_by_email(email: str, org_id: str) -> Optional[dict]:
-    db = get_db(); doc = await db.users.find_one({"email": email, "org_id": org_id}); return _serialize(doc)
+async def get_user_by_email(email: str, org_id = None) -> Optional[dict]:
+    db = get_db()
+    query = {"email": email}
+    if org_id: query["org_id"] = org_id
+    doc = await db.users.find_one(query); return _serialize(doc)
 
 async def get_user_by_username(username: str) -> Optional[dict]:
     db = get_db(); doc = await db.users.find_one({"username": username}); return _serialize(doc)
