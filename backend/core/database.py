@@ -9,8 +9,8 @@ from bson import ObjectId
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-DB_NAME   = os.getenv("DB_NAME", "sentinel360")
+MONGO_URL = os.getenv("MONGO_URL") or os.getenv("MONGO_URI", "mongodb://localhost:27017")
+DB_NAME  = os.getenv("DB_NAME", "sentinel360")
 
 client: Optional[AsyncIOMotorClient] = None
 
