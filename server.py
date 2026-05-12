@@ -6,14 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 
-# Meus módulos internos
+# Meus mÃ³dulos internos
 import scanner_engine
 import database
 import auth_manager # Para gerar tokens e hash de senha
 
 app = FastAPI(title="Sentinel 360 API")
 
-# Configuração de CORS para aceitar o seu Frontend (Vercel ou Local)
+# ConfiguraÃ§Ã£o de CORS para aceitar o seu Frontend (Vercel ou Local)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -43,16 +43,16 @@ class ScanState:
 
 state = ScanState()
 
-# --- ENDPOINTS DE AUTENTICAÇÃO ---
+# --- ENDPOINTS DE AUTENTICAÃÃO ---
 
 @app.post("/register")
 async def register(user: UserAuth):
-    # Verifica se usuário já existe
+    # Verifica se usuÃ¡rio jÃ¡ existe
     existing_user = database.db["users"].find_one({"username": user.username})
     if existing_user:
-        raise HTTPException(status_code=400, detail="Usuário já cadastrado.")
+        raise HTTPException(status_code=400, detail="UsuÃ¡rio jÃ¡ cadastrado.")
     
-    # Cria o hash da senha por segurança
+    # Cria o hash da senha por seguranÃ§a
     hashed_password = auth_manager.get_password_hash(user.password)
     
     user_data = {
@@ -64,20 +64,21 @@ async def register(user: UserAuth):
     }
     
     database.db["users"].insert_one(user_data)
-    return {"message": "Usuário registrado com sucesso!"}
+    return {"message": "UsuÃ¡rio registrado com sucesso!"}
 
 @app.post("/login")
 async def login(user: UserAuth):
+    # Aceita login por username OU email
     db_user = database.db["users"].find_one({"username": user.username})
+    if not db_user:
+        db_user = database.db["users"].find_one({"email": user.username})
     
     if not db_user or not auth_manager.verify_password(user.password, db_user["password"]):
         raise HTTPException(status_code=401, detail="Credenciais inválidas.")
     
     # Gera o token JWT real
-    access_token = auth_manager.create_access_token(data={"sub": user.username})
+    access_token = auth_manager.create_access_token(data={"sub": db_user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
-
-# --- ENDPOINTS DO SCANNER ---
 
 @app.get("/scan-status")
 def get_scan_status():
@@ -92,7 +93,7 @@ def get_scan_status():
 @app.post("/scan")
 async def start_scan(background_tasks: BackgroundTasks, days: int = 180):
     if state.is_scanning:
-        return {"message": "Varredura já em curso."}
+        return {"message": "Varredura jÃ¡ em curso."}
     
     state.is_scanning = True
     state.progress = 0
@@ -122,7 +123,7 @@ async def delete_item(path: str):
             try: os.remove(path)
             except: pass
         return {"message": "Item removido com sucesso."}
-    raise HTTPException(status_code=404, detail="Item não encontrado no banco.")
+    raise HTTPException(status_code=404, detail="Item nÃ£o encontrado no banco.")
 
 @app.get("/ping")
 async def ping():
