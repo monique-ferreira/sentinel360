@@ -6,14 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 
-# Meus mÃ³dulos internos
+# Meus mÃÂ³dulos internos
 import scanner_engine
 import database
 import auth_manager # Para gerar tokens e hash de senha
 
 app = FastAPI(title="Sentinel 360 API")
 
-# ConfiguraÃ§Ã£o de CORS para aceitar o seu Frontend (Vercel ou Local)
+# ConfiguraÃÂ§ÃÂ£o de CORS para aceitar o seu Frontend (Vercel ou Local)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -43,16 +43,16 @@ class ScanState:
 
 state = ScanState()
 
-# --- ENDPOINTS DE AUTENTICAÃÃO ---
+# --- ENDPOINTS DE AUTENTICAÃÂÃÂO ---
 
 @app.post("/register")
 async def register(user: UserAuth):
-    # Verifica se usuÃ¡rio jÃ¡ existe
+    # Verifica se usuÃÂ¡rio jÃÂ¡ existe
     existing_user = database.db["users"].find_one({"username": user.username})
     if existing_user:
-        raise HTTPException(status_code=400, detail="UsuÃ¡rio jÃ¡ cadastrado.")
+        raise HTTPException(status_code=400, detail="UsuÃÂ¡rio jÃÂ¡ cadastrado.")
     
-    # Cria o hash da senha por seguranÃ§a
+    # Cria o hash da senha por seguranÃÂ§a
     hashed_password = auth_manager.get_password_hash(user.password)
     
     user_data = {
@@ -64,7 +64,7 @@ async def register(user: UserAuth):
     }
     
     database.db["users"].insert_one(user_data)
-    return {"message": "UsuÃ¡rio registrado com sucesso!"}
+    return {"message": "UsuÃÂ¡rio registrado com sucesso!"}
 
 @app.post("/login")
 async def login(user: UserAuth):
@@ -74,7 +74,7 @@ async def login(user: UserAuth):
         db_user = database.db["users"].find_one({"email": user.username})
     
     if not db_user or not auth_manager.verify_password(user.password, db_user["password"]):
-        raise HTTPException(status_code=401, detail="Credenciais inválidas.")
+        raise HTTPException(status_code=401, detail="Credenciais invÃ¡lidas.")
     
     # Gera o token JWT real
     access_token = auth_manager.create_access_token(data={"sub": db_user["username"]})
@@ -93,7 +93,7 @@ def get_scan_status():
 @app.post("/scan")
 async def start_scan(background_tasks: BackgroundTasks, days: int = 180):
     if state.is_scanning:
-        return {"message": "Varredura jÃ¡ em curso."}
+        return {"message": "Varredura jÃÂ¡ em curso."}
     
     state.is_scanning = True
     state.progress = 0
@@ -123,11 +123,91 @@ async def delete_item(path: str):
             try: os.remove(path)
             except: pass
         return {"message": "Item removido com sucesso."}
-    raise HTTPException(status_code=404, detail="Item nÃ£o encontrado no banco.")
+    raise HTTPException(status_code=404, detail="Item nÃÂ£o encontrado no banco.")
 
 @app.get("/ping")
 async def ping():
     return {"status": "alive", "timestamp": time.time()}
+
+
+# ── Microsoft 365 Integration ──
+
+_ms365_config = {}
+
+class MS365ConfigRequest(BaseModel):
+    tenant_id: str
+    client_id: str
+    client_secret: str
+
+@app.post("/integrations/office365/configure")
+async def configure_office365(body: MS365ConfigRequest):
+    _ms365_config["tenant_id"] = body.tenant_id
+    _ms365_config["client_id"] = body.client_id
+    _ms365_config["client_secret"] = body.client_secret
+    return {"message": "Credenciais do Office 365 salvas com sucesso."}
+
+@app.get("/integrations/office365/audit")
+async def audit_office365(inactive_days: int = 90):
+    if not _ms365_config.get("tenant_id"):
+        raise HTTPException(status_code=400, detail="Office 365 nao configurado. Salve as credenciais primeiro.")
+    try:
+        import httpx
+        # Get access token
+        token_url = f"https://login.microsoftonline.com/{_ms365_config['tenant_id']}/oauth2/v2.0/token"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(token_url, data={
+                "grant_type": "client_credentials",
+                "client_id": _ms365_config["client_id"],
+                "client_secret": _ms365_config["client_secret"],
+                "scope": "https://graph.microsoft.com/.default",
+            })
+            resp.raise_for_status()
+            access_token = resp.json()["access_token"]
+
+        # Get users
+        from datetime import datetime, timedelta
+        threshold = (datetime.utcnow() - timedelta(days=inactive_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://graph.microsoft.com/v1.0/users",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={
+                    "$select": "id,displayName,userPrincipalName,signInActivity,accountEnabled",
+                    "$filter": "accountEnabled eq true",
+                    "$top": "999",
+                }
+            )
+            resp.raise_for_status()
+            users = resp.json().get("value", [])
+
+        inactive = []
+        for u in users:
+            sign_in = u.get("signInActivity") or {}
+            last = sign_in.get("lastSignInDateTime")
+            if not last or last < threshold:
+                try:
+                    days_diff = (datetime.utcnow() - datetime.fromisoformat(last.replace("Z", "+00:00")).replace(tzinfo=None)).days if last else -1
+                except Exception:
+                    days_diff = -1
+                inactive.append({
+                    "id": u["id"],
+                    "display_name": u.get("displayName", ""),
+                    "email": u.get("userPrincipalName", ""),
+                    "last_signin": last,
+                    "days_inactive": days_diff,
+                })
+        return {
+            "total_users": len(users),
+            "inactive_users": inactive,
+            "inactive_count": len(inactive),
+            "inactive_threshold": inactive_days,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao consultar Office 365: {str(e)}")
+
+@app.get("/integrations/office365/users")
+async def list_office365_users():
+    return await audit_office365(inactive_days=9999)
 
 if __name__ == "__main__":
     import uvicorn
