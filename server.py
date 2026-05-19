@@ -1,132 +1,367 @@
+"""
+server.py — API FastAPI do Sentinel360
+
+Endpoints:
+  Auth:        POST /register  POST /login  POST /forgot-password
+  Scan:        POST /scan  GET /scan-status
+  Results:     GET /results  DELETE /delete-item  GET /export/csv
+  Integrations:
+    POST /integrations/office365/configure   GET /integrations/office365/audit
+    POST /integrations/azure/configure       GET /integrations/azure/audit
+  Health:      GET /ping
+"""
+
+import csv
+import io
 import os
 import time
 from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
+
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from jose import JWTError
+from pydantic import BaseModel, EmailStr
 
-# Meus módulos internos
-import scanner_engine
+import auth_manager
 import database
-import auth_manager # Para gerar tokens e hash de senha
+import scanner_engine
+import ms_graph
 
-app = FastAPI(title="Sentinel 360 API")
+# ── App & CORS ────────────────────────────────────────────────────────────────
 
-# Configuração de CORS para aceitar o seu Frontend (Vercel ou Local)
+app = FastAPI(title="Sentinel360 API", version="2.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Frontend local
-        "https://sentinel360-cyber.vercel.app"  # Frontend Vercel
-    ],
+    allow_origins=["*"],   # Em produção: restrinja ao domínio do frontend
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- MODELOS DE DADOS ---
+# ── Modelos ───────────────────────────────────────────────────────────────────
 
-class UserAuth(BaseModel):
+class RegisterBody(BaseModel):
     username: str
     password: str
     email: Optional[str] = None
-    fullname: Optional[str] = None
+    full_name: Optional[str] = None
+    org_name: Optional[str] = None
+    org_slug: Optional[str] = None
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class ForgotPasswordBody(BaseModel):
+    email: str
+
+
+class IntegrationConfigBody(BaseModel):
+    tenant_id: str
+    client_id: str
+    client_secret: str
+
+
+# ── Estado do scan ────────────────────────────────────────────────────────────
 
 class ScanState:
     def __init__(self):
-        self.is_scanning = False
-        self.progress = 0
-        self.total_files = 0
+        self.is_scanning   = False
+        self.progress      = 0.0
+        self.total_files   = 0
         self.processed_files = 0
-        self.eta_seconds = 0
-        self.start_time = 0
+        self.eta_seconds   = 0
+        self.start_time    = 0.0
+
 
 state = ScanState()
 
-# --- ENDPOINTS DE AUTENTICAÇÃO ---
+# ── Autenticação via JWT ──────────────────────────────────────────────────────
 
-@app.post("/register")
-async def register(user: UserAuth):
-    # Verifica se usuário já existe
-    existing_user = database.db["users"].find_one({"username": user.username})
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Usuário já cadastrado.")
-    
-    # Cria o hash da senha por segurança
-    hashed_password = auth_manager.get_password_hash(user.password)
-    
-    user_data = {
-        "username": user.username,
-        "password": hashed_password,
-        "email": user.email,
-        "fullname": user.fullname,
-        "created_at": time.time()
-    }
-    
-    database.db["users"].insert_one(user_data)
-    return {"message": "Usuário registrado com sucesso!"}
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+    """Dependência: valida JWT e retorna username."""
+    credentials_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token inválido ou expirado.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = auth_manager.decode_token(token)
+        username: str = payload.get("sub")
+        if not username:
+            raise credentials_exc
+    except JWTError:
+        raise credentials_exc
+
+    user = database.find_user(username)
+    if user is None:
+        raise credentials_exc
+    return username
+
+
+# ── Endpoints de autenticação ─────────────────────────────────────────────────
+
+@app.post("/register", status_code=201)
+async def register(body: RegisterBody):
+    if database.find_user(body.username):
+        raise HTTPException(status_code=409, detail="Usuário já cadastrado.")
+    if body.email and database.find_user_by_email(body.email):
+        raise HTTPException(status_code=409, detail="Email já cadastrado.")
+
+    database.create_user({
+        "username":  body.username,
+        "password":  auth_manager.get_password_hash(body.password),
+        "email":     body.email,
+        "full_name": body.full_name,
+        "org_name":  body.org_name,
+        "org_slug":  body.org_slug,
+        "created_at": time.time(),
+    })
+    database.log_action("REGISTRO", f"Novo usuário: {body.username}")
+    return {"message": "Conta criada com sucesso."}
+
 
 @app.post("/login")
-async def login(user: UserAuth):
-    db_user = database.db["users"].find_one({"username": user.username})
-    
-    if not db_user or not auth_manager.verify_password(user.password, db_user["password"]):
-        raise HTTPException(status_code=401, detail="Credenciais inválidas.")
-    
-    # Gera o token JWT real
-    access_token = auth_manager.create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
+async def login(body: LoginBody):
+    user = database.find_user(body.username)
+    if not user or not auth_manager.verify_password(body.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
 
-# --- ENDPOINTS DO SCANNER ---
+    token = auth_manager.create_access_token({"sub": body.username})
+    database.log_action("LOGIN", f"Usuário autenticado: {body.username}")
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/forgot-password")
+async def forgot_password(body: ForgotPasswordBody):
+    """
+    Registra a solicitação de recuperação de senha.
+    Em produção: enviar email com link de redefinição.
+    Retorna 200 sempre (não vaza se email existe).
+    """
+    user = database.find_user_by_email(body.email)
+    if user:
+        database.log_action("RECUPERAÇÃO_SENHA", f"Solicitação para: {body.email}")
+        # TODO: integrar com serviço de email (SendGrid, SES, etc.)
+    return {"message": "Se o email existir no sistema, você receberá instruções em breve."}
+
+
+# ── Endpoints do scanner ──────────────────────────────────────────────────────
 
 @app.get("/scan-status")
-def get_scan_status():
+def get_scan_status(_: str = Depends(get_current_user)):
     return {
-        "is_scanning": state.is_scanning,
-        "progress": round(state.progress, 1),
-        "total": state.total_files,
-        "processed": state.processed_files,
-        "eta_seconds": state.eta_seconds
+        "is_scanning":  state.is_scanning,
+        "progress":     round(state.progress, 1),
+        "total":        state.total_files,
+        "processed":    state.processed_files,
+        "eta_seconds":  state.eta_seconds,
     }
 
-@app.post("/scan")
-async def start_scan(background_tasks: BackgroundTasks, days: int = 180):
-    if state.is_scanning:
-        return {"message": "Varredura já em curso."}
-    
-    state.is_scanning = True
-    state.progress = 0
-    background_tasks.add_task(run_and_store, days)
-    return {"message": "Motor Sentinel iniciado."}
 
-def run_and_store(days):
+@app.post("/scan")
+async def start_scan(
+    background_tasks: BackgroundTasks,
+    days: int = 180,
+    _: str = Depends(get_current_user),
+):
+    if state.is_scanning:
+        raise HTTPException(status_code=409, detail="Varredura já em curso.")
+    if days < 1 or days > 3650:
+        raise HTTPException(status_code=422, detail="Parâmetro 'days' deve estar entre 1 e 3650.")
+
+    state.is_scanning = True
+    state.progress    = 0.0
+    state.eta_seconds = 0
+    background_tasks.add_task(_run_and_store, days)
+    return {"message": f"Motor Sentinel iniciado (limiar: {days} dias)."}
+
+
+def _run_and_store(days: int):
     try:
-        # O scanner_engine agora recebe o objeto 'state' para atualizar o progresso
-        resultados = scanner_engine.run_full_scan(days, state)
-        database.save_scan_results(resultados)
+        results = scanner_engine.run_full_scan(days, state)
+        database.save_scan_results(results)
+        database.log_action("SCAN_CONCLUÍDO", f"Dias: {days} | Encontrados: {len(results)}")
+    except Exception as e:
+        print(f"[SCAN] Erro crítico: {e}")
+        database.log_action("SCAN_ERRO", str(e), status="ERRO")
     finally:
         state.is_scanning = False
-        state.progress = 100
+        state.progress    = 100.0
+
 
 @app.get("/results")
-def get_results():
-    items = database.get_all_results()
-    return {"items": items}
+def get_results(_: str = Depends(get_current_user)):
+    return {"items": database.get_all_results()}
+
 
 @app.delete("/delete-item")
-async def delete_item(path: str):
+async def delete_item(path: str, _: str = Depends(get_current_user)):
+    if not path.strip():
+        raise HTTPException(status_code=422, detail="Caminho inválido.")
+
     success = database.delete_specific_file(path)
-    if success:
-        # Tenta deletar do disco se estiver rodando local
-        if os.path.exists(path):
-            try: os.remove(path)
-            except: pass
-        return {"message": "Item removido com sucesso."}
-    raise HTTPException(status_code=404, detail="Item não encontrado no banco.")
+    if not success:
+        raise HTTPException(status_code=404, detail="Item não encontrado no banco.")
+
+    # Tenta remover fisicamente (falha silenciosa se não tiver permissão)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError as e:
+            print(f"[DELETE] Não foi possível remover do disco: {e}")
+
+    return {"message": "Item removido com sucesso."}
+
+
+@app.get("/export/csv")
+def export_csv(_: str = Depends(get_current_user)):
+    """Exporta todos os resultados do último scan como arquivo CSV."""
+    items = database.get_all_results()
+    if not items:
+        raise HTTPException(status_code=404, detail="Nenhum resultado para exportar.")
+
+    output = io.StringIO()
+    fields = ["nome", "caminho", "inativo", "riscos", "tamanho_mb", "last_scan"]
+    writer = csv.DictWriter(output, fieldnames=fields, delimiter=";", extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(items)
+    output.seek(0)
+
+    filename = f"sentinel360_relatorio_{int(time.time())}.csv"
+    return StreamingResponse(
+        iter([output.getvalue().encode("utf-8-sig")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── Integrações — Microsoft 365 ───────────────────────────────────────────────
+
+@app.post("/integrations/office365/configure")
+async def configure_ms365(
+    body: IntegrationConfigBody,
+    _: str = Depends(get_current_user),
+):
+    """
+    Salva credenciais do Microsoft 365 e valida a conectividade.
+
+    Permissões necessárias no App Registration:
+      Mail.Read · Sites.Read.All · Files.Read.All · User.Read.All · AuditLog.Read.All
+    """
+    # Testa as credenciais antes de salvar
+    result = ms_graph.test_credentials(body.tenant_id, body.client_id, body.client_secret)
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Credenciais inválidas ou sem permissão: {result['error']}",
+        )
+
+    database.save_integration_config("ms365", {
+        "tenant_id": body.tenant_id,
+        "client_id": body.client_id,
+        "client_secret": body.client_secret,  # armazenado criptografado em produção
+        "org_name": result.get("org_name", ""),
+    })
+    database.log_action("CONFIG_MS365", f"Org: {result.get('org_name', '')}")
+    return {"message": "Credenciais M365 salvas.", "org_name": result.get("org_name")}
+
+
+@app.get("/integrations/office365/audit")
+async def audit_ms365(
+    inactive_days: int = 90,
+    _: str = Depends(get_current_user),
+):
+    """Lista usuários inativos do Microsoft 365."""
+    config = database.get_integration_config("ms365")
+    if not config:
+        raise HTTPException(status_code=404, detail="Credenciais M365 não configuradas.")
+
+    try:
+        users = ms_graph.audit_inactive_users_ms365(
+            config["tenant_id"],
+            config["client_id"],
+            config["client_secret"],
+            inactive_days=inactive_days,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Erro ao consultar Microsoft Graph: {e}")
+
+    database.log_action("AUDIT_MS365", f"Encontrados: {len(users)} inativos ({inactive_days}d)")
+    return {"inactive_users": users, "total": len(users)}
+
+
+# ── Integrações — Azure Active Directory ─────────────────────────────────────
+
+@app.post("/integrations/azure/configure")
+async def configure_azure(
+    body: IntegrationConfigBody,
+    _: str = Depends(get_current_user),
+):
+    """
+    Salva credenciais do Azure AD e valida a conectividade.
+
+    Permissões necessárias no App Registration:
+      User.Read.All · Directory.Read.All · AuditLog.Read.All
+    Após adicionar: conceda admin consent para a organização.
+    """
+    result = ms_graph.test_credentials(body.tenant_id, body.client_id, body.client_secret)
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Credenciais inválidas ou sem permissão: {result['error']}",
+        )
+
+    database.save_integration_config("azure", {
+        "tenant_id": body.tenant_id,
+        "client_id": body.client_id,
+        "client_secret": body.client_secret,
+        "org_name": result.get("org_name", ""),
+    })
+    database.log_action("CONFIG_AZURE", f"Org: {result.get('org_name', '')}")
+    return {"message": "Credenciais Azure AD salvas.", "org_name": result.get("org_name")}
+
+
+@app.get("/integrations/azure/audit")
+async def audit_azure(
+    inactive_days: int = 90,
+    _: str = Depends(get_current_user),
+):
+    """Lista usuários inativos do Azure Active Directory."""
+    config = database.get_integration_config("azure")
+    if not config:
+        raise HTTPException(status_code=404, detail="Credenciais Azure AD não configuradas.")
+
+    try:
+        users = ms_graph.audit_inactive_users_azure(
+            config["tenant_id"],
+            config["client_id"],
+            config["client_secret"],
+            inactive_days=inactive_days,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Erro ao consultar Microsoft Graph: {e}")
+
+    database.log_action("AUDIT_AZURE", f"Encontrados: {len(users)} inativos ({inactive_days}d)")
+    return {"inactive_users": users, "total": len(users)}
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/ping")
 async def ping():
-    return {"status": "alive", "timestamp": time.time()}
+    return {"status": "alive", "version": "2.0.0", "timestamp": time.time()}
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
