@@ -128,6 +128,51 @@ def get_integration_config(provider: str) -> dict | None:
         return None
 
 
+# ── cloud scan results ────────────────────────────────────────────────────────
+
+def save_cloud_results(provider: str, results: list) -> bool:
+    """Salva resultados de varredura cloud (ms365 | azure). Substitui scan anterior do mesmo provedor."""
+    if not results:
+        return False
+    try:
+        col = _col("cloud_results")
+        scan_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for item in results:
+            item["last_scan"] = scan_date
+            item["cloud_provider"] = provider
+        col.delete_many({"cloud_provider": provider})
+        col.insert_many(results)
+        _col("scan_history").insert_one({
+            "data": scan_date,
+            "tipo": f"cloud_{provider}",
+            "total_arquivos": len(results),
+            "inativos": sum(1 for i in results if i.get("inativo") == "SIM"),
+            "com_risco": sum(1 for i in results if i.get("riscos") not in ("NENHUM", "")),
+        })
+        return True
+    except Exception as e:
+        print(f"[ERRO DB] save_cloud_results: {e}")
+        return False
+
+
+def get_cloud_results(provider: str | None = None) -> list:
+    """Retorna resultados cloud. Se provider=None, retorna todos."""
+    try:
+        query = {"cloud_provider": provider} if provider else {}
+        return list(_col("cloud_results").find(query, {"_id": 0}))
+    except Exception as e:
+        print(f"[ERRO DB] get_cloud_results: {e}")
+        return []
+
+
+def get_scan_history() -> list:
+    try:
+        return list(_col("scan_history").find({}, {"_id": 0}).sort("data", -1).limit(50))
+    except Exception as e:
+        print(f"[ERRO DB] get_scan_history: {e}")
+        return []
+
+
 # ── activity logs ─────────────────────────────────────────────────────────────
 
 def log_action(acao: str, detalhes: str, status: str = "OK") -> None:

@@ -7,19 +7,24 @@ Endpoints:
   Results:     GET /results  DELETE /delete-item  GET /export/csv
   Integrations:
     POST /integrations/office365/configure   GET /integrations/office365/audit
+    POST /integrations/office365/scan-files  GET /integrations/office365/file-results
     POST /integrations/azure/configure       GET /integrations/azure/audit
+    POST /integrations/azure/scan-files      GET /integrations/azure/file-results
+  Report:      GET /report/bi
   Health:      GET /ping
 """
 
 import csv
 import io
+import json
 import os
+import threading
 import time
 from typing import Optional
 
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
 from pydantic import BaseModel, EmailStr
@@ -28,6 +33,7 @@ import auth_manager
 import database
 import scanner_engine
 import ms_graph
+import bi_report
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 
@@ -80,6 +86,17 @@ class ScanState:
 
 
 state = ScanState()
+
+
+class CloudScanState:
+    def __init__(self):
+        self.is_scanning = False
+        self.progress    = 0.0
+        self.provider    = ""
+        self.error       = ""
+
+
+cloud_state = CloudScanState()
 
 # ── Autenticação via JWT ──────────────────────────────────────────────────────
 
@@ -352,6 +369,127 @@ async def audit_azure(
 
     database.log_action("AUDIT_AZURE", f"Encontrados: {len(users)} inativos ({inactive_days}d)")
     return {"inactive_users": users, "total": len(users)}
+
+
+# ── Integrações — Varredura de arquivos cloud ─────────────────────────────────
+
+@app.post("/integrations/office365/scan-files")
+async def scan_ms365_files(
+    days: int = 180,
+    _: str = Depends(get_current_user),
+):
+    """
+    Dispara varredura de arquivos SharePoint + OneDrive em background.
+    Permissões: Sites.Read.All · Files.Read.All · User.Read.All
+    """
+    if cloud_state.is_scanning:
+        raise HTTPException(status_code=409, detail="Varredura cloud já em curso.")
+    config = database.get_integration_config("ms365")
+    if not config:
+        raise HTTPException(status_code=404, detail="Credenciais M365 não configuradas.")
+
+    cloud_state.is_scanning = True
+    cloud_state.progress    = 0.0
+    cloud_state.provider    = "ms365"
+    cloud_state.error       = ""
+
+    def _run():
+        try:
+            class Ref:
+                progress = 0.0
+            ref = Ref()
+            results = ms_graph.scan_sharepoint_files(
+                config["tenant_id"], config["client_id"], config["client_secret"],
+                days_threshold=days, state_ref=ref,
+            )
+            cloud_state.progress = 50.0
+            results += ms_graph.scan_onedrive_files(
+                config["tenant_id"], config["client_id"], config["client_secret"],
+                days_threshold=days,
+            )
+            database.save_cloud_results("ms365", results)
+            database.log_action("SCAN_MS365", f"Encontrados: {len(results)} | Dias: {days}")
+        except Exception as e:
+            cloud_state.error = str(e)
+            database.log_action("SCAN_MS365_ERRO", str(e), status="ERRO")
+        finally:
+            cloud_state.is_scanning = False
+            cloud_state.progress    = 100.0
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"message": f"Varredura MS365 iniciada (limiar: {days} dias)."}
+
+
+@app.get("/integrations/office365/scan-status")
+def cloud_scan_status(_: str = Depends(get_current_user)):
+    return {
+        "is_scanning": cloud_state.is_scanning,
+        "progress":    round(cloud_state.progress, 1),
+        "provider":    cloud_state.provider,
+        "error":       cloud_state.error,
+    }
+
+
+@app.get("/integrations/office365/file-results")
+def ms365_file_results(_: str = Depends(get_current_user)):
+    """Retorna resultados da última varredura SharePoint/OneDrive."""
+    return {"items": database.get_cloud_results("ms365")}
+
+
+@app.post("/integrations/azure/scan-files")
+async def scan_azure_files(
+    days: int = 180,
+    _: str = Depends(get_current_user),
+):
+    """
+    Dispara varredura de arquivos OneDrive via credenciais Azure AD.
+    Permissões: User.Read.All · Files.Read.All
+    """
+    if cloud_state.is_scanning:
+        raise HTTPException(status_code=409, detail="Varredura cloud já em curso.")
+    config = database.get_integration_config("azure")
+    if not config:
+        raise HTTPException(status_code=404, detail="Credenciais Azure AD não configuradas.")
+
+    cloud_state.is_scanning = True
+    cloud_state.progress    = 0.0
+    cloud_state.provider    = "azure"
+    cloud_state.error       = ""
+
+    def _run():
+        try:
+            results = ms_graph.scan_onedrive_files(
+                config["tenant_id"], config["client_id"], config["client_secret"],
+                days_threshold=days,
+            )
+            database.save_cloud_results("azure", results)
+            database.log_action("SCAN_AZURE", f"Encontrados: {len(results)} | Dias: {days}")
+        except Exception as e:
+            cloud_state.error = str(e)
+            database.log_action("SCAN_AZURE_ERRO", str(e), status="ERRO")
+        finally:
+            cloud_state.is_scanning = False
+            cloud_state.progress    = 100.0
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"message": f"Varredura Azure AD/OneDrive iniciada (limiar: {days} dias)."}
+
+
+@app.get("/integrations/azure/file-results")
+def azure_file_results(_: str = Depends(get_current_user)):
+    return {"items": database.get_cloud_results("azure")}
+
+
+# ── Relatório BI ──────────────────────────────────────────────────────────────
+
+@app.get("/report/bi", response_class=HTMLResponse)
+async def get_bi_report(_: str = Depends(get_current_user)):
+    """Gera e retorna relatório BI HTML completo com Chart.js."""
+    local_items   = database.get_all_results()
+    cloud_items   = database.get_cloud_results()
+    scan_history  = database.get_scan_history()
+    html = bi_report.generate(local_items, cloud_items, scan_history)
+    return HTMLResponse(content=html)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

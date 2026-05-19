@@ -1,17 +1,16 @@
 """
 ms_graph.py — Integração com Microsoft Graph API
 
-Usado por:
-  - Microsoft 365 (Exchange, SharePoint, Teams): auditoria de emails, arquivos externos
-  - Azure Active Directory: usuários inativos, contas sem MFA, grupos de segurança
-
-Requisitos:
-  - pip install msal requests
-  - App Registration no Azure Portal com as permissões configuradas
+Funções:
+  Autenticação:  _get_token, test_credentials
+  Usuários:      audit_inactive_users_azure, audit_inactive_users_ms365
+  Arquivos cloud: scan_sharepoint_files, scan_onedrive_files
+  Utilitários:   _days_since, _graph_get, _graph_get_single, _download_content
 """
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -24,23 +23,62 @@ try:
 except ImportError:
     _MSAL_AVAILABLE = False
 
-
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-AUTHORITY  = "https://login.microsoftonline.com/{tenant_id}"
+
+# ── Padrões de risco (mesmo conjunto do scanner local) ────────────────────────
+
+SENSITIVE_PATTERNS: dict[str, str] = {
+    "Credencial": (
+        r"(?i)(password|passwd|senha|pwd|secret|api_key|apikey|access_key|token)"
+        r"\s*[=:\"']+\s*[^\s\"']{6,}"
+    ),
+    "Chave Privada": (
+        r"-----BEGIN\s+(RSA|DSA|EC|OPENSSH|PGP|PRIVATE)\s+KEY(?: BLOCK)?-----"
+    ),
+    "Token/Key": (
+        r"(?:"
+        r"AKIA[0-9A-Z]{16}"
+        r"|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}"
+        r"|sk-[A-Za-z0-9]{20,}"
+        r"|xoxb-[0-9A-Za-z\-]+"
+        r"|AIza[0-9A-Za-z\-_]{35}"
+        r"|[0-9a-f]{32,64}(?=\s|$|[\"'])"
+        r")"
+    ),
+    "CPF":  r"\b\d{3}[.\-]?\d{3}[.\-]?\d{3}[-]?\d{2}\b",
+    "CNPJ": r"\b\d{2}[.\-]?\d{3}[.\-]?\d{3}[\/]?\d{4}[-]?\d{2}\b",
+    "Email": r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
+    "Connection String": (
+        r"(?i)(mongodb(\+srv)?://|mysql://|postgres(ql)?://|mssql://)[^\s\"'<>]+"
+    ),
+}
+
+TEXT_EXT = {
+    ".txt", ".log", ".conf", ".cfg", ".ini", ".py", ".js", ".ts",
+    ".json", ".sql", ".env", ".xml", ".yaml", ".yml", ".toml",
+    ".sh", ".bash", ".ps1", ".bat", ".cmd", ".csv", ".md",
+    ".html", ".htm", ".php", ".rb", ".go", ".properties",
+}
+
+SENSITIVE_FILENAMES = re.compile(
+    r"(?i)(password|passwd|credentials|secrets?|private[_\-]?key"
+    r"|\.env|id_rsa|id_dsa|id_ecdsa|id_ed25519|\.pem|\.p12|\.pfx"
+    r"|htpasswd|shadow|config\.ini|secrets\.json)",
+    re.IGNORECASE,
+)
+
+MAX_FILE_BYTES = 8192   # bytes lidos de cada arquivo de texto
+MAX_FILES_PER_SCAN = 5000  # limite de segurança para scans grandes
 
 
 # ── Autenticação ───────────────────────────────────────────────────────────────
 
 def _get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
-    """Obtém access token via Client Credentials Flow (sem usuário interativo)."""
     if not _MSAL_AVAILABLE:
         raise RuntimeError("msal não instalado. Execute: pip install msal")
-
-    authority = AUTHORITY.format(tenant_id=tenant_id)
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
     app = msal.ConfidentialClientApplication(
-        client_id,
-        authority=authority,
-        client_credential=client_secret,
+        client_id, authority=authority, client_credential=client_secret,
     )
     result = app.acquire_token_for_client(
         scopes=["https://graph.microsoft.com/.default"]
@@ -51,27 +89,60 @@ def _get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     return result["access_token"]
 
 
-def _graph_get(token: str, url: str, params: dict | None = None) -> dict:
-    """Faz GET paginado no Microsoft Graph e retorna todos os valores."""
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    all_values = []
-    next_url: Optional[str] = url
+# ── Helpers HTTP ───────────────────────────────────────────────────────────────
 
+def _headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _graph_get(token: str, url: str, params: dict | None = None) -> dict:
+    """GET paginado — retorna todos os valores de todas as páginas."""
+    all_values: list = []
+    next_url: Optional[str] = url
+    h = _headers(token)
     while next_url:
-        resp = requests.get(next_url, headers=headers, params=params, timeout=30)
-        params = None  # só usa params na primeira chamada
+        resp = requests.get(next_url, headers=h, params=params, timeout=30)
+        params = None
+        if resp.status_code == 429:
+            retry = int(resp.headers.get("Retry-After", "5"))
+            time.sleep(retry)
+            continue
         resp.raise_for_status()
         data = resp.json()
         all_values.extend(data.get("value", []))
         next_url = data.get("@odata.nextLink")
-
     return {"value": all_values}
+
+
+def _graph_get_single(token: str, url: str) -> dict:
+    resp = requests.get(url, headers=_headers(token), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _download_content(token: str, download_url: str) -> str:
+    """Baixa os primeiros MAX_FILE_BYTES do arquivo e retorna como texto."""
+    try:
+        resp = requests.get(
+            download_url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20,
+            stream=True,
+        )
+        resp.raise_for_status()
+        raw = b""
+        for chunk in resp.iter_content(chunk_size=MAX_FILE_BYTES):
+            raw += chunk
+            if len(raw) >= MAX_FILE_BYTES:
+                break
+        return raw[:MAX_FILE_BYTES].decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
 # ── Helpers de data ────────────────────────────────────────────────────────────
 
 def _days_since(iso_date: Optional[str]) -> int:
-    """Retorna dias desde uma data ISO 8601, ou -1 se null."""
     if not iso_date:
         return -1
     try:
@@ -81,53 +152,232 @@ def _days_since(iso_date: Optional[str]) -> int:
         return -1
 
 
-# ── Azure Active Directory ─────────────────────────────────────────────────────
+# ── Análise de arquivo individual ─────────────────────────────────────────────
 
-def audit_inactive_users_azure(
+def _analyze_item(
+    token: str,
+    item: dict,
+    site_name: str,
+    drive_name: str,
+    days_threshold: int,
+) -> dict | None:
+    """
+    Analisa um item do SharePoint/OneDrive.
+    Retorna dict de resultado ou None se não for relevante.
+    """
+    name = item.get("name", "")
+    size = item.get("size", 0)
+    web_url = item.get("webUrl", "")
+    last_modified = item.get("lastModifiedDateTime", "")
+    days_ago = _days_since(last_modified)
+    is_inactive = days_ago >= days_threshold if days_ago >= 0 else False
+
+    risks: list[str] = []
+
+    # Detecta pelo nome
+    if SENSITIVE_FILENAMES.search(name):
+        risks.append("Credencial")
+
+    # Detecta pelo conteúdo (só arquivos de texto e razoável tamanho)
+    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    download_url = item.get("@microsoft.graph.downloadUrl") or (
+        item.get("file", {}).get("downloadUrl") if item.get("file") else None
+    )
+    if ext in TEXT_EXT and 0 < size <= 2 * 1024 * 1024 and download_url:
+        content = _download_content(token, download_url)
+        for label, pattern in SENSITIVE_PATTERNS.items():
+            if re.search(pattern, content) and label not in risks:
+                risks.append(label)
+
+    if not is_inactive and not risks:
+        return None
+
+    return {
+        "nome":       name,
+        "caminho":    web_url,
+        "origem":     f"SharePoint — {site_name}/{drive_name}",
+        "inativo":    "SIM" if is_inactive else "NÃO",
+        "riscos":     ", ".join(risks) if risks else "NENHUM",
+        "tamanho_mb": round(size / (1024 * 1024), 3),
+        "last_scan":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "dias_sem_acesso": days_ago,
+    }
+
+
+def _walk_drive(
+    token: str,
+    drive_id: str,
+    item_id: str,
+    site_name: str,
+    drive_name: str,
+    days_threshold: int,
+    results: list,
+    counter: list,  # [int] — mutable counter
+) -> None:
+    """Percorre recursivamente uma pasta do drive e analisa arquivos."""
+    if counter[0] >= MAX_FILES_PER_SCAN:
+        return
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/children"
+    try:
+        data = _graph_get(token, url)
+    except Exception as e:
+        print(f"[GRAPH] Erro ao listar pasta {item_id}: {e}")
+        return
+
+    for item in data.get("value", []):
+        if counter[0] >= MAX_FILES_PER_SCAN:
+            break
+        if "folder" in item:
+            _walk_drive(
+                token, drive_id, item["id"],
+                site_name, drive_name, days_threshold, results, counter,
+            )
+        elif "file" in item:
+            counter[0] += 1
+            result = _analyze_item(token, item, site_name, drive_name, days_threshold)
+            if result:
+                results.append(result)
+
+
+# ── Varredura SharePoint ───────────────────────────────────────────────────────
+
+def scan_sharepoint_files(
     tenant_id: str,
     client_id: str,
     client_secret: str,
-    inactive_days: int = 90,
+    days_threshold: int = 180,
+    state_ref=None,
 ) -> list[dict]:
     """
-    Retorna usuários do Azure AD cujo último login é anterior a `inactive_days`.
+    Varre todos os sites SharePoint da organização.
 
-    Permissões necessárias no App Registration:
-      - User.Read.All
-      - AuditLog.Read.All   (para signInActivity — requer Azure AD P1/P2)
-      - Directory.Read.All
+    Permissões necessárias:
+      Sites.Read.All · Files.Read.All
 
     Args:
-        tenant_id: Directory (tenant) ID do Azure AD.
-        client_id: Application (client) ID do App Registration.
-        client_secret: Segredo gerado no App Registration.
-        inactive_days: Limiar de inatividade em dias.
+        days_threshold: Arquivos sem modificação há N dias são marcados inativos.
+        state_ref:      Objeto opcional com .progress, .processed_files, .total_files
+                        para atualização de progresso em tempo real.
 
     Returns:
-        Lista de dicts com: display_name, email, days_inactive, account_enabled.
+        Lista de dicts compatível com o schema de resultados locais, com campo
+        "origem" indicando "SharePoint — Site/Drive".
     """
     token = _get_token(tenant_id, client_id, client_secret)
+    results: list[dict] = []
+    counter = [0]
 
+    # 1. Listar todos os sites
+    print("[GRAPH] Listando sites SharePoint...")
+    try:
+        sites_data = _graph_get(token, f"{GRAPH_BASE}/sites?search=*")
+        sites = sites_data.get("value", [])
+    except Exception as e:
+        raise RuntimeError(f"Erro ao listar sites SharePoint: {e}")
+
+    print(f"[GRAPH] {len(sites)} site(s) encontrado(s).")
+
+    for si, site in enumerate(sites):
+        if counter[0] >= MAX_FILES_PER_SCAN:
+            print(f"[GRAPH] Limite de {MAX_FILES_PER_SCAN} arquivos atingido.")
+            break
+
+        site_id   = site["id"]
+        site_name = site.get("displayName") or site.get("name") or site_id
+
+        # 2. Listar drives (bibliotecas de documentos) do site
+        try:
+            drives_data = _graph_get(token, f"{GRAPH_BASE}/sites/{site_id}/drives")
+            drives = drives_data.get("value", [])
+        except Exception as e:
+            print(f"[GRAPH] Erro ao listar drives de {site_name}: {e}")
+            continue
+
+        for drive in drives:
+            if counter[0] >= MAX_FILES_PER_SCAN:
+                break
+            drive_id   = drive["id"]
+            drive_name = drive.get("name", drive_id)
+            print(f"[GRAPH] Varrendo: {site_name}/{drive_name} ...")
+            _walk_drive(
+                token, drive_id, "root",
+                site_name, drive_name, days_threshold, results, counter,
+            )
+
+        if state_ref is not None:
+            state_ref.progress = round((si + 1) / len(sites) * 100, 1)
+
+    print(f"[GRAPH] SharePoint scan concluído. {len(results)} itens relevantes de {counter[0]} arquivos varridos.")
+    return results
+
+
+# ── Varredura OneDrive (todos os usuários) ────────────────────────────────────
+
+def scan_onedrive_files(
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    days_threshold: int = 180,
+    max_users: int = 50,
+) -> list[dict]:
+    """
+    Varre o OneDrive for Business de cada usuário da organização.
+
+    Permissões necessárias:
+      User.Read.All · Files.Read.All
+
+    Args:
+        max_users: Limite de usuários varridos (evita scans excessivamente longos).
+
+    Returns:
+        Lista de dicts com campo "origem": "OneDrive — <email>".
+    """
+    token = _get_token(tenant_id, client_id, client_secret)
+    results: list[dict] = []
+    counter = [0]
+
+    users_data = _graph_get(
+        token,
+        f"{GRAPH_BASE}/users?$select=id,displayName,mail,userPrincipalName&$top=999",
+    )
+    users = users_data.get("value", [])[:max_users]
+    print(f"[GRAPH] OneDrive scan: {len(users)} usuário(s).")
+
+    for user in users:
+        if counter[0] >= MAX_FILES_PER_SCAN:
+            break
+        uid   = user["id"]
+        email = user.get("mail") or user.get("userPrincipalName", uid)
+        try:
+            drive_resp = _graph_get_single(token, f"{GRAPH_BASE}/users/{uid}/drive")
+            drive_id   = drive_resp["id"]
+        except Exception:
+            continue
+
+        _walk_drive(token, drive_id, "root", "OneDrive", email, days_threshold, results, counter)
+
+    print(f"[GRAPH] OneDrive scan concluído. {len(results)} itens relevantes.")
+    return results
+
+
+# ── Auditoria de usuários ─────────────────────────────────────────────────────
+
+def audit_inactive_users_azure(
+    tenant_id: str, client_id: str, client_secret: str, inactive_days: int = 90,
+) -> list[dict]:
+    token = _get_token(tenant_id, client_id, client_secret)
     url = (
         f"{GRAPH_BASE}/users"
         "?$select=displayName,mail,userPrincipalName,accountEnabled,signInActivity"
         "&$top=999"
     )
     data = _graph_get(token, url)
-
     inactive: list[dict] = []
     for user in data["value"]:
         sign_in = user.get("signInActivity") or {}
-        last_interactive = sign_in.get("lastSignInDateTime")
-        last_non_interactive = sign_in.get("lastNonInteractiveSignInDateTime")
-
-        # Usa o mais recente entre os dois tipos de login
-        days_int = _days_since(last_interactive)
-        days_non = _days_since(last_non_interactive)
-        days_ago = min(
-            d for d in (days_int, days_non) if d >= 0
-        ) if any(d >= 0 for d in (days_int, days_non)) else -1
-
+        days_i = _days_since(sign_in.get("lastSignInDateTime"))
+        days_n = _days_since(sign_in.get("lastNonInteractiveSignInDateTime"))
+        days_ago = min(d for d in (days_i, days_n) if d >= 0) if any(d >= 0 for d in (days_i, days_n)) else -1
         if days_ago == -1 or days_ago >= inactive_days:
             inactive.append({
                 "display_name":    user.get("displayName") or user.get("userPrincipalName", ""),
@@ -135,92 +385,44 @@ def audit_inactive_users_azure(
                 "days_inactive":   days_ago,
                 "account_enabled": user.get("accountEnabled", True),
             })
-
     return inactive
 
 
-# ── Microsoft 365 ─────────────────────────────────────────────────────────────
-
 def audit_inactive_users_ms365(
-    tenant_id: str,
-    client_id: str,
-    client_secret: str,
-    inactive_days: int = 90,
+    tenant_id: str, client_id: str, client_secret: str, inactive_days: int = 90,
 ) -> list[dict]:
-    """
-    Audita usuários inativos do Microsoft 365 (Exchange/SharePoint).
-
-    Usa o mesmo endpoint de signInActivity do Graph, mas com foco em
-    licenciados para Exchange / SharePoint.
-
-    Permissões necessárias:
-      - User.Read.All
-      - AuditLog.Read.All
-      - Mail.Read (para auditoria de Exchange)
-      - Sites.Read.All (para auditoria de SharePoint)
-
-    Returns:
-        Lista de dicts com: display_name, email, days_inactive, licenses.
-    """
     token = _get_token(tenant_id, client_id, client_secret)
-
     url = (
         f"{GRAPH_BASE}/users"
-        "?$select=displayName,mail,userPrincipalName,accountEnabled"
-        ",signInActivity,assignedLicenses"
+        "?$select=displayName,mail,userPrincipalName,accountEnabled,signInActivity,assignedLicenses"
         "&$top=999"
     )
     data = _graph_get(token, url)
-
-    # SKUs que indicam licença Microsoft 365
-    M365_SKUS = {
-        "6fd2c87f-b296-42f0-b197-1e91e994b900",  # Office 365 E3
-        "c7df2760-2c81-4ef7-b578-5b5392b571df",  # Office 365 E5
-        "18181a46-0d4e-45cd-891e-60aabd171b4e",  # Office 365 Business Essentials
-        "f30db892-07e9-47e9-837c-80727f46fd3d",  # Microsoft 365 Business Basic
-        "cbdc14ab-d96c-4c30-b9f4-6ada7cdc1d46",  # Microsoft 365 Business Premium
-    }
-
     inactive: list[dict] = []
     for user in data["value"]:
-        # Filtra apenas usuários com licença M365 (opcional — descomente se quiser filtrar)
-        # licenses = [l.get("skuId") for l in user.get("assignedLicenses", [])]
-        # if not any(s in M365_SKUS for s in licenses):
-        #     continue
-
-        sign_in = user.get("signInActivity") or {}
-        last_sign_in = sign_in.get("lastSignInDateTime")
-        days_ago = _days_since(last_sign_in)
-
+        sign_in  = user.get("signInActivity") or {}
+        days_ago = _days_since(sign_in.get("lastSignInDateTime"))
         if days_ago == -1 or days_ago >= inactive_days:
             inactive.append({
-                "display_name":  user.get("displayName") or user.get("userPrincipalName", ""),
-                "email":         user.get("mail") or user.get("userPrincipalName", ""),
-                "days_inactive": days_ago,
+                "display_name":    user.get("displayName") or user.get("userPrincipalName", ""),
+                "email":           user.get("mail") or user.get("userPrincipalName", ""),
+                "days_inactive":   days_ago,
                 "account_enabled": user.get("accountEnabled", True),
             })
-
     return inactive
 
 
-# ── Verificação de credenciais (teste de conectividade) ───────────────────────
+# ── Teste de credenciais ──────────────────────────────────────────────────────
 
 def test_credentials(tenant_id: str, client_id: str, client_secret: str) -> dict:
-    """
-    Testa se as credenciais são válidas obtendo o token e consultando a organização.
-
-    Returns:
-        {"ok": True, "org_name": "..."} ou {"ok": False, "error": "..."}
-    """
     try:
         token = _get_token(tenant_id, client_id, client_secret)
-        resp = requests.get(
+        resp  = requests.get(
             f"{GRAPH_BASE}/organization",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
+            headers=_headers(token), timeout=15,
         )
         resp.raise_for_status()
-        orgs = resp.json().get("value", [])
+        orgs     = resp.json().get("value", [])
         org_name = orgs[0].get("displayName", "Desconhecido") if orgs else "Desconhecido"
         return {"ok": True, "org_name": org_name}
     except Exception as e:
