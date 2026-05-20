@@ -206,8 +206,9 @@ def _analyze_item(
         "inativo":    "SIM" if is_inactive else "NÃO",
         "riscos":     ", ".join(risks) if risks else "NENHUM",
         "tamanho_mb": round(size / (1024 * 1024), 3),
-        "last_scan":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_scan":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "dias_sem_acesso": days_ago,
+        "ultimo_acesso":   last_accessed[:10] if last_accessed else "",
     }
 
 
