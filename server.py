@@ -3,6 +3,11 @@ server.py — API FastAPI do Sentinel360
 
 Endpoints:
   Auth:        POST /register  POST /login  POST /forgot-password
+  Profile:     GET /user/me  PUT /user/me  GET /user/settings  PUT /user/settings
+  Orgs:        GET /orgs/search  POST /orgs/create  POST /orgs/join
+               GET /orgs/my/requests  POST /orgs/my/requests/{username}/approve
+               POST /orgs/my/requests/{username}/reject  GET /orgs/my/members
+  Workspace:   GET /workspace
   Results:     GET /results  DELETE /delete-item  GET /export/csv
   Integrations:
     POST /integrations/office365/configure   GET /integrations/office365/audit
@@ -70,8 +75,30 @@ class RegisterBody(BaseModel):
     password: str
     email: Optional[str] = None
     full_name: Optional[str] = None
+    account_type: Optional[str] = "personal"  # "personal" | "corporate"
     org_name: Optional[str] = None
     org_slug: Optional[str] = None
+    org_action: Optional[str] = None  # "create" | "join"
+    org_id: Optional[str] = None      # for joining existing org
+
+
+class UpdateProfileBody(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    inactivity_days: Optional[int] = None
+
+
+class UserSettingsBody(BaseModel):
+    inactivity_days: int
+
+
+class CreateOrgBody(BaseModel):
+    name: str
+    slug: str
+
+
+class JoinOrgBody(BaseModel):
+    org_id: str
 
 
 class LoginBody(BaseModel):
@@ -168,22 +195,174 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
 
 @app.post("/register", status_code=201)
 async def register(body: RegisterBody):
+    import uuid as _uuid
     if database.find_user(body.username):
         raise HTTPException(status_code=409, detail="Usuário já cadastrado.")
     if body.email and database.find_user_by_email(body.email):
         raise HTTPException(status_code=409, detail="Email já cadastrado.")
 
-    database.create_user({
-        "username":   body.username,
-        "password":   auth_manager.get_password_hash(body.password),
-        "email":      body.email,
-        "full_name":  body.full_name,
-        "org_name":   body.org_name,
-        "org_slug":   body.org_slug,
-        "created_at": time.time(),
-    })
-    database.log_action("REGISTRO", f"Novo usuário: {body.username}", owner=body.username)
+    account_type = body.account_type or "personal"
+    user_doc: dict = {
+        "username":        body.username,
+        "password":        auth_manager.get_password_hash(body.password),
+        "email":           body.email,
+        "full_name":       body.full_name,
+        "account_type":    account_type,
+        "inactivity_days": 180,
+        "created_at":      time.time(),
+    }
+
+    if account_type == "corporate":
+        if body.org_action == "create" and body.org_name:
+            org_id   = str(_uuid.uuid4())
+            org_slug = (body.org_slug or body.org_name.lower().replace(" ", "-")).replace(" ", "-")
+            database.create_org(org_id, body.org_name, org_slug, body.username)
+            user_doc.update({"org_id": org_id, "org_role": "admin", "org_status": "approved"})
+        elif body.org_action == "join" and body.org_id:
+            org = database.get_org_by_id(body.org_id)
+            if not org:
+                raise HTTPException(status_code=404, detail="Organização não encontrada.")
+            database.create_join_request(body.org_id, body.username)
+            user_doc.update({"org_id": body.org_id, "org_role": "member", "org_status": "pending"})
+
+    database.create_user(user_doc)
+    database.log_action("REGISTRO", f"Novo usuário: {body.username} ({account_type})", owner=body.username)
     return {"message": "Conta criada com sucesso."}
+
+
+# ── User profile & settings ───────────────────────────────────────────────────
+
+@app.get("/user/me")
+async def get_me(username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    org_name = None
+    org_member_count = None
+    if settings.get("org_id"):
+        org = database.get_org_by_id(settings["org_id"])
+        if org:
+            org_name = org.get("name")
+            if settings.get("org_role") == "admin":
+                org_member_count = len(database.get_org_members(settings["org_id"]))
+    return {
+        "username":        username,
+        "full_name":       settings.get("full_name"),
+        "email":           settings.get("email"),
+        "account_type":    settings.get("account_type", "personal"),
+        "org_id":          settings.get("org_id"),
+        "org_role":        settings.get("org_role"),
+        "org_status":      settings.get("org_status"),
+        "org_name":        org_name,
+        "org_member_count": org_member_count,
+        "inactivity_days": settings.get("inactivity_days", 180),
+    }
+
+
+@app.put("/user/me")
+async def update_me(body: UpdateProfileBody, username: str = Depends(get_current_user)):
+    updates = {k: v for k, v in body.dict().items() if v is not None}
+    if body.email and body.email != database.get_user_settings(username).get("email"):
+        if database.find_user_by_email(body.email):
+            raise HTTPException(status_code=409, detail="Email já em uso.")
+    database.update_user_settings(username, updates)
+    return {"message": "Perfil atualizado."}
+
+
+@app.get("/user/settings")
+async def get_user_settings_ep(username: str = Depends(get_current_user)):
+    s = database.get_user_settings(username)
+    return {"inactivity_days": s.get("inactivity_days", 180)}
+
+
+@app.put("/user/settings")
+async def put_user_settings(body: UserSettingsBody, username: str = Depends(get_current_user)):
+    database.update_user_settings(username, {"inactivity_days": body.inactivity_days})
+    return {"message": "Configurações salvas.", "inactivity_days": body.inactivity_days}
+
+
+# ── Orgs ──────────────────────────────────────────────────────────────────────
+
+@app.get("/orgs/search")
+async def orgs_search(q: str = ""):
+    """Public endpoint — used during registration autocomplete (no auth required)."""
+    if not q.strip():
+        return {"orgs": []}
+    return {"orgs": database.search_orgs(q.strip())}
+
+
+@app.post("/orgs/create", status_code=201)
+async def orgs_create(body: CreateOrgBody, username: str = Depends(get_current_user)):
+    import uuid as _uuid
+    org_id = str(_uuid.uuid4())
+    database.create_org(org_id, body.name, body.slug, username)
+    database._col("users").update_one(
+        {"username": username},
+        {"$set": {"org_id": org_id, "org_role": "admin", "org_status": "approved",
+                  "account_type": "corporate"}}
+    )
+    database.log_action("CREATE_ORG", f"Org criada: {body.name}", owner=username)
+    return {"message": "Organização criada.", "org_id": org_id}
+
+
+@app.post("/orgs/join")
+async def orgs_join(body: JoinOrgBody, username: str = Depends(get_current_user)):
+    org = database.get_org_by_id(body.org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organização não encontrada.")
+    database.create_join_request(body.org_id, username)
+    database._col("users").update_one(
+        {"username": username},
+        {"$set": {"org_id": body.org_id, "org_role": "member", "org_status": "pending",
+                  "account_type": "corporate"}}
+    )
+    database.log_action("JOIN_ORG", f"Solicitação para: {org['name']}", owner=username)
+    return {"message": "Solicitação enviada. Aguardando aprovação."}
+
+
+@app.get("/orgs/my/requests")
+async def orgs_my_requests(username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem ver solicitações.")
+    requests = database.get_join_requests(settings["org_id"], "pending")
+    return {"requests": requests}
+
+
+@app.post("/orgs/my/requests/{req_username}/approve")
+async def orgs_approve(req_username: str, username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem aprovar.")
+    database.update_join_request(settings["org_id"], req_username, "approved")
+    database.log_action("APPROVE_MEMBER", f"Aprovado: {req_username}", owner=username)
+    return {"message": f"{req_username} aprovado."}
+
+
+@app.post("/orgs/my/requests/{req_username}/reject")
+async def orgs_reject(req_username: str, username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem rejeitar.")
+    database.update_join_request(settings["org_id"], req_username, "rejected")
+    database.log_action("REJECT_MEMBER", f"Rejeitado: {req_username}", owner=username)
+    return {"message": f"{req_username} rejeitado."}
+
+
+@app.get("/orgs/my/members")
+async def orgs_my_members(username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores.")
+    members = database.get_org_members(settings["org_id"])
+    return {"members": members}
+
+
+@app.get("/workspace")
+async def get_workspace(username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores.")
+    data = database.get_workspace_data(settings["org_id"])
+    return data
 
 
 @app.post("/login")
