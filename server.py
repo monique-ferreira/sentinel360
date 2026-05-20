@@ -37,6 +37,7 @@ import auth_manager
 import database
 import ms_graph
 import bi_report
+import bi_excel
 
 # ── OAuth Microsoft (delegated) ───────────────────────────────────────────────
 
@@ -537,18 +538,19 @@ async def personal_file_results(username: str = Depends(get_current_user)):
     return {"items": database.get_cloud_results(username, "personal")}
 
 
-# ── Relatório BI (download automático) ───────────────────────────────────────
+# ── Relatório BI — Excel editável (abre no Power BI Desktop via "Obter Dados") ─
 
 @app.get("/report/bi")
 async def get_bi_report(username: str = Depends(get_current_user)):
     cloud_items  = database.get_cloud_results(owner=username)
     scan_history = database.get_scan_history(owner=username)
-    html = bi_report.generate([], cloud_items, scan_history)
+    xlsx_bytes = bi_excel.generate(cloud_items, scan_history)
 
-    filename = f"sentinel360_bi_{int(time.time())}.html"
+    from datetime import date
+    filename = f"sentinel360_bi_{date.today().isoformat()}.xlsx"
     return StreamingResponse(
-        iter([html.encode("utf-8")]),
-        media_type="text/html",
+        iter([xlsx_bytes]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

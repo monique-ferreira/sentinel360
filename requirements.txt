@@ -10,3 +10,4 @@ bcrypt==4.0.1
 msal
 requests
 python-dotenv
+openpyxl>=3.1.0
