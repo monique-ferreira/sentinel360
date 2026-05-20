@@ -76,9 +76,11 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
     t = ws_kpi["A1"]
     t.value = "SENTINEL360 — RELATÓRIO BI"
     t.font  = Font(name="Calibri", bold=True, color=ACCENT, size=16)
+    t.fill  = _fill("FFFFFF")
 
     ws_kpi["A2"] = f"Gerado em: {generated_at}"
     ws_kpi["A2"].font = _font(color="666666", size=9)
+    ws_kpi["A2"].fill = _fill("FFFFFF")
 
     total     = len(cloud_items)
     inativos  = sum(1 for i in cloud_items if i.get("inativo") == "SIM")
@@ -100,6 +102,7 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
         lc.border = _border()
 
         vc = ws_kpi.cell(row=5, column=col, value=value)
+        vc.fill  = _fill("FFFFFF")
         vc.font  = Font(name="Calibri", bold=True, color=color, size=20)
         vc.alignment = Alignment(horizontal="center", vertical="center")
         vc.border = _border()
@@ -113,12 +116,19 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
             if r and r not in ("NENHUM", ""):
                 risk_counter[r] += 1
 
-    ws_kpi.cell(row=7, column=1, value="Categoria de Risco").font = _font(bold=True, color=ACCENT, size=11)
-    ws_kpi.cell(row=7, column=2, value="Quantidade").font = _font(bold=True, color=ACCENT, size=11)
+    h7a = ws_kpi.cell(row=7, column=1, value="Categoria de Risco")
+    h7a.font = _font(bold=True, color=ACCENT, size=11)
+    h7a.fill = _fill("FFFFFF")
+    h7b = ws_kpi.cell(row=7, column=2, value="Quantidade")
+    h7b.font = _font(bold=True, color=ACCENT, size=11)
+    h7b.fill = _fill("FFFFFF")
     for i, (label, count) in enumerate(risk_counter.most_common(), 1):
-        ws_kpi.cell(row=7 + i, column=1, value=label).font = _font()
-        c = ws_kpi.cell(row=7 + i, column=2, value=count)
-        c.font = _font(bold=True, color=RED)
+        ca = ws_kpi.cell(row=7 + i, column=1, value=label)
+        ca.font = _font()
+        ca.fill = _fill("FFFFFF")
+        cb = ws_kpi.cell(row=7 + i, column=2, value=count)
+        cb.font = _font(bold=True, color=RED)
+        cb.fill = _fill("FFFFFF")
 
     # ── Sheet 2: Todos os arquivos ────────────────────────────────────────────
     ws_files = wb.create_sheet("Arquivos")
@@ -126,6 +136,7 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
 
     ws_files["A1"].value = "Resultados de Varredura"
     ws_files["A1"].font = Font(name="Calibri", bold=True, color=ACCENT, size=13)
+    ws_files["A1"].fill = _fill("FFFFFF")
 
     _header_row(ws_files, 2, ["Nome", "Caminho / URL", "Origem", "Riscos", "Inativo", "Tamanho (MB)", "Último Scan"])
 
@@ -153,6 +164,7 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
     risky = [i for i in cloud_items if i.get("riscos") not in ("NENHUM", "", None)]
     ws_risk["A1"].value = f"Arquivos de Alto Risco ({len(risky)} itens)"
     ws_risk["A1"].font = Font(name="Calibri", bold=True, color=RED, size=13)
+    ws_risk["A1"].fill = _fill("FFFFFF")
 
     _header_row(ws_risk, 2, ["Nome", "Caminho / URL", "Origem", "Riscos", "Inativo", "Último Scan"])
 
@@ -175,6 +187,7 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
 
     ws_hist["A1"].value = "Histórico de Varreduras"
     ws_hist["A1"].font = Font(name="Calibri", bold=True, color=ACCENT, size=13)
+    ws_hist["A1"].fill = _fill("FFFFFF")
 
     _header_row(ws_hist, 2, ["Data / Hora", "Tipo", "Arquivos Analisados", "Com Risco", "Inativos"])
 
@@ -195,6 +208,7 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
     ws_charts = wb.create_sheet("Gráficos")
     ws_charts["A1"].value = "Gráficos de Análise"
     ws_charts["A1"].font = Font(name="Calibri", bold=True, color=ACCENT, size=13)
+    ws_charts["A1"].fill = _fill("FFFFFF")
 
     # ── Dados para gráfico de pizza: categorias de risco (cols A-B a partir da linha 3)
     risk_list = list(risk_counter.most_common(8))
