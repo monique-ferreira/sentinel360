@@ -164,12 +164,19 @@ def _analyze_item(
     """
     Analisa um item do SharePoint/OneDrive.
     Retorna dict de resultado ou None se não for relevante.
+    Usa lastAccessedDateTime se disponível, senão lastModifiedDateTime.
     """
     name = item.get("name", "")
     size = item.get("size", 0)
     web_url = item.get("webUrl", "")
-    last_modified = item.get("lastModifiedDateTime", "")
-    days_ago = _days_since(last_modified)
+    # Prefer lastAccessedDateTime (actual use), fall back to lastModifiedDateTime
+    file_info = item.get("file", {}) or {}
+    last_accessed = (
+        item.get("lastAccessedDateTime")
+        or file_info.get("lastAccessedDateTime")
+        or item.get("lastModifiedDateTime", "")
+    )
+    days_ago = _days_since(last_accessed)
     is_inactive = days_ago >= days_threshold if days_ago >= 0 else False
 
     risks: list[str] = []

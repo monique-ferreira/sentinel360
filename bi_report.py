@@ -222,6 +222,28 @@ def generate(
     </table>
   </div>
 
+  <!-- Scan history table -->
+  <div class="table-card">
+    <h3>Histórico de Varreduras</h3>
+    <table>
+      <thead><tr>
+        <th>Data / Hora</th><th>Tipo</th><th>Arquivos analisados</th><th>Com risco</th><th>Inativos</th>
+      </tr></thead>
+      <tbody>
+        {"".join(
+            f'<tr>'
+            f'<td>{h.get("data","—")}</td>'
+            f'<td><span class="badge" style="background:rgba(88,166,255,.1);color:#58a6ff;border:1px solid rgba(88,166,255,.2)">{h.get("tipo","—")}</span></td>'
+            f'<td>{h.get("total_arquivos",0):,}</td>'
+            f'<td><span style="color:#f85149">{h.get("com_risco",0):,}</span></td>'
+            f'<td><span style="color:#d29922">{h.get("inativos",0):,}</span></td>'
+            f'</tr>'
+            for h in scan_history[:20]
+        ) or '<tr><td colspan="5" style="text-align:center;color:#484f58;padding:24px">Nenhum histórico de scan encontrado.</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+
   <footer>Sentinel360 Cyber Defense Platform &nbsp;·&nbsp; Relatório gerado automaticamente em {generated_at}</footer>
 </div>
 
