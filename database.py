@@ -1,6 +1,6 @@
 import os
 import certifi
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient
 from datetime import datetime
 
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -12,9 +12,8 @@ try:
     print("[DB] Conectado ao MongoDB Atlas.")
 except Exception as e:
     print(f"[ERRO DB] Falha na conexão: {e}")
-    db = None  # servidor inicia mesmo sem banco
+    db = None
 
-# ── coleções ──────────────────────────────────────────────────────────────────
 
 def _col(name):
     if db is None:
@@ -22,53 +21,64 @@ def _col(name):
     return db[name]
 
 
-# ── scan_results ──────────────────────────────────────────────────────────────
+# ── cloud scan results (isolados por usuário) ─────────────────────────────────
 
-def save_scan_results(results: list) -> bool:
+def save_cloud_results(owner: str, provider: str, results: list) -> bool:
     if not results:
         return False
     try:
-        col = _col("scan_results")
+        col = _col("cloud_results")
         scan_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for item in results:
-            item["last_scan"] = scan_date
-        col.delete_many({})
+            item["last_scan"]      = scan_date
+            item["cloud_provider"] = provider
+            item["owner"]          = owner
+        col.delete_many({"owner": owner, "cloud_provider": provider})
         col.insert_many(results)
-
-        # salva resumo no histórico de scans
         _col("scan_history").insert_one({
-            "data": scan_date,
+            "owner":          owner,
+            "data":           scan_date,
+            "tipo":           f"cloud_{provider}",
             "total_arquivos": len(results),
-            "inativos": sum(1 for i in results if i.get("inativo") == "SIM"),
-            "com_risco": sum(1 for i in results if i.get("riscos") not in ("NENHUM", "")),
+            "inativos":       sum(1 for i in results if i.get("inativo") == "SIM"),
+            "com_risco":      sum(1 for i in results if i.get("riscos") not in ("NENHUM", "")),
         })
         return True
     except Exception as e:
-        print(f"[ERRO DB] save_scan_results: {e}")
+        print(f"[ERRO DB] save_cloud_results: {e}")
         return False
 
 
-def get_all_results() -> list:
+def get_cloud_results(owner: str, provider: str | None = None) -> list:
     try:
-        return list(_col("scan_results").find({}, {"_id": 0}))
+        query: dict = {"owner": owner}
+        if provider:
+            query["cloud_provider"] = provider
+        return list(_col("cloud_results").find(query, {"_id": 0, "owner": 0}))
     except Exception as e:
-        print(f"[ERRO DB] get_all_results: {e}")
+        print(f"[ERRO DB] get_cloud_results: {e}")
         return []
 
 
-def delete_specific_file(path: str) -> bool:
+def get_scan_history(owner: str) -> list:
     try:
-        col = _col("scan_results")
-        result = col.delete_one({"caminho": path})
-        _col("activity_logs").insert_one({
-            "acao": "REMOÇÃO",
-            "caminho": path,
-            "data": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "SUCESSO" if result.deleted_count > 0 else "NÃO ENCONTRADO",
-        })
+        return list(
+            _col("scan_history")
+            .find({"owner": owner}, {"_id": 0, "owner": 0})
+            .sort("data", -1)
+            .limit(50)
+        )
+    except Exception as e:
+        print(f"[ERRO DB] get_scan_history: {e}")
+        return []
+
+
+def delete_cloud_result(owner: str, caminho: str) -> bool:
+    try:
+        result = _col("cloud_results").delete_one({"owner": owner, "caminho": caminho})
         return result.deleted_count > 0
     except Exception as e:
-        print(f"[ERRO DB] delete_specific_file: {e}")
+        print(f"[ERRO DB] delete_cloud_result: {e}")
         return False
 
 
@@ -99,18 +109,14 @@ def create_user(user_data: dict) -> bool:
         return False
 
 
-# ── integration configs ───────────────────────────────────────────────────────
+# ── integration configs (isoladas por usuário) ────────────────────────────────
 
-def save_integration_config(provider: str, config: dict) -> bool:
-    """
-    Salva/atualiza credenciais de integração (ms365 | azure).
-    Armazena apenas tenant_id e client_id em texto; client_secret
-    não é recuperado pelo GET — fica opaco no banco.
-    """
+def save_integration_config(owner: str, provider: str, config: dict) -> bool:
     try:
         _col("integration_configs").update_one(
-            {"provider": provider},
-            {"$set": {**config, "provider": provider, "updated_at": datetime.now().isoformat()}},
+            {"owner": owner, "provider": provider},
+            {"$set": {**config, "owner": owner, "provider": provider,
+                      "updated_at": datetime.now().isoformat()}},
             upsert=True,
         )
         return True
@@ -119,69 +125,26 @@ def save_integration_config(provider: str, config: dict) -> bool:
         return False
 
 
-def get_integration_config(provider: str) -> dict | None:
+def get_integration_config(owner: str, provider: str) -> dict | None:
     try:
-        doc = _col("integration_configs").find_one({"provider": provider}, {"_id": 0})
-        return doc
+        return _col("integration_configs").find_one(
+            {"owner": owner, "provider": provider}, {"_id": 0}
+        )
     except Exception as e:
         print(f"[ERRO DB] get_integration_config: {e}")
         return None
 
 
-# ── cloud scan results ────────────────────────────────────────────────────────
-
-def save_cloud_results(provider: str, results: list) -> bool:
-    """Salva resultados de varredura cloud (ms365 | azure). Substitui scan anterior do mesmo provedor."""
-    if not results:
-        return False
-    try:
-        col = _col("cloud_results")
-        scan_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for item in results:
-            item["last_scan"] = scan_date
-            item["cloud_provider"] = provider
-        col.delete_many({"cloud_provider": provider})
-        col.insert_many(results)
-        _col("scan_history").insert_one({
-            "data": scan_date,
-            "tipo": f"cloud_{provider}",
-            "total_arquivos": len(results),
-            "inativos": sum(1 for i in results if i.get("inativo") == "SIM"),
-            "com_risco": sum(1 for i in results if i.get("riscos") not in ("NENHUM", "")),
-        })
-        return True
-    except Exception as e:
-        print(f"[ERRO DB] save_cloud_results: {e}")
-        return False
-
-
-def get_cloud_results(provider: str | None = None) -> list:
-    """Retorna resultados cloud. Se provider=None, retorna todos."""
-    try:
-        query = {"cloud_provider": provider} if provider else {}
-        return list(_col("cloud_results").find(query, {"_id": 0}))
-    except Exception as e:
-        print(f"[ERRO DB] get_cloud_results: {e}")
-        return []
-
-
-def get_scan_history() -> list:
-    try:
-        return list(_col("scan_history").find({}, {"_id": 0}).sort("data", -1).limit(50))
-    except Exception as e:
-        print(f"[ERRO DB] get_scan_history: {e}")
-        return []
-
-
 # ── activity logs ─────────────────────────────────────────────────────────────
 
-def log_action(acao: str, detalhes: str, status: str = "OK") -> None:
+def log_action(acao: str, detalhes: str, status: str = "OK", owner: str = "") -> None:
     try:
         _col("activity_logs").insert_one({
-            "acao": acao,
+            "owner":    owner,
+            "acao":     acao,
             "detalhes": detalhes,
-            "status": status,
-            "data": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status":   status,
+            "data":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
     except Exception as e:
         print(f"[ERRO DB] log_action: {e}")

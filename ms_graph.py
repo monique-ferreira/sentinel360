@@ -213,6 +213,7 @@ def _walk_drive(
     days_threshold: int,
     results: list,
     counter: list,  # [int] — mutable counter
+    progress_cb=None,  # Callable[[int], None] | None — called after each file
 ) -> None:
     """Percorre recursivamente uma pasta do drive e analisa arquivos."""
     if counter[0] >= MAX_FILES_PER_SCAN:
@@ -230,13 +231,15 @@ def _walk_drive(
         if "folder" in item:
             _walk_drive(
                 token, drive_id, item["id"],
-                site_name, drive_name, days_threshold, results, counter,
+                site_name, drive_name, days_threshold, results, counter, progress_cb,
             )
         elif "file" in item:
             counter[0] += 1
             result = _analyze_item(token, item, site_name, drive_name, days_threshold)
             if result:
                 results.append(result)
+            if progress_cb:
+                progress_cb(counter[0])
 
 
 # ── Varredura SharePoint ───────────────────────────────────────────────────────
@@ -247,6 +250,7 @@ def scan_sharepoint_files(
     client_secret: str,
     days_threshold: int = 180,
     state_ref=None,
+    progress_cb=None,
 ) -> list[dict]:
     """
     Varre todos os sites SharePoint da organização.
@@ -301,7 +305,7 @@ def scan_sharepoint_files(
             print(f"[GRAPH] Varrendo: {site_name}/{drive_name} ...")
             _walk_drive(
                 token, drive_id, "root",
-                site_name, drive_name, days_threshold, results, counter,
+                site_name, drive_name, days_threshold, results, counter, progress_cb,
             )
 
         if state_ref is not None:
@@ -319,6 +323,7 @@ def scan_onedrive_files(
     client_secret: str,
     days_threshold: int = 180,
     max_users: int = 50,
+    progress_cb=None,
 ) -> list[dict]:
     """
     Varre o OneDrive for Business de cada usuário da organização.
@@ -354,7 +359,7 @@ def scan_onedrive_files(
         except Exception:
             continue
 
-        _walk_drive(token, drive_id, "root", "OneDrive", email, days_threshold, results, counter)
+        _walk_drive(token, drive_id, "root", "OneDrive", email, days_threshold, results, counter, progress_cb)
 
     print(f"[GRAPH] OneDrive scan concluído. {len(results)} itens relevantes.")
     return results
@@ -362,7 +367,7 @@ def scan_onedrive_files(
 
 # ── Varredura OneDrive pessoal (token delegado) ───────────────────────────────
 
-def scan_onedrive_personal(access_token: str, days_threshold: int = 180) -> list[dict]:
+def scan_onedrive_personal(access_token: str, days_threshold: int = 180, progress_cb=None) -> list[dict]:
     """
     Varre o OneDrive do usuário autenticado via token delegado.
     Não requer admin consent — acessa apenas os arquivos do próprio usuário.
@@ -372,7 +377,7 @@ def scan_onedrive_personal(access_token: str, days_threshold: int = 180) -> list
     try:
         drive_resp = _graph_get_single(access_token, f"{GRAPH_BASE}/me/drive")
         drive_id = drive_resp["id"]
-        _walk_drive(access_token, drive_id, "root", "OneDrive Pessoal", "Meus Arquivos", days_threshold, results, counter)
+        _walk_drive(access_token, drive_id, "root", "OneDrive Pessoal", "Meus Arquivos", days_threshold, results, counter, progress_cb)
     except Exception as e:
         print(f"[GRAPH] Erro ao varrer OneDrive pessoal: {e}")
     print(f"[GRAPH] OneDrive pessoal: {len(results)} itens relevantes de {counter[0]} arquivos.")
