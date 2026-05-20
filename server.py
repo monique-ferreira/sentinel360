@@ -22,7 +22,7 @@ import threading
 import time
 from typing import Optional
 
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer
@@ -31,7 +31,6 @@ from pydantic import BaseModel, EmailStr
 
 import auth_manager
 import database
-import scanner_engine
 import ms_graph
 import bi_report
 
@@ -75,21 +74,6 @@ class IntegrationConfigBody(BaseModel):
     tenant_id: str
     client_id: str
     client_secret: str
-
-
-# ── Estado do scan ────────────────────────────────────────────────────────────
-
-class ScanState:
-    def __init__(self):
-        self.is_scanning   = False
-        self.progress      = 0.0
-        self.total_files   = 0
-        self.processed_files = 0
-        self.eta_seconds   = 0
-        self.start_time    = 0.0
-
-
-state = ScanState()
 
 
 class CloudScanState:
@@ -175,78 +159,14 @@ async def forgot_password(body: ForgotPasswordBody):
     return {"message": "Se o email existir no sistema, você receberá instruções em breve."}
 
 
-# ── Endpoints do scanner ──────────────────────────────────────────────────────
-
-@app.get("/scan-status")
-def get_scan_status(_: str = Depends(get_current_user)):
-    return {
-        "is_scanning":  state.is_scanning,
-        "progress":     round(state.progress, 1),
-        "total":        state.total_files,
-        "processed":    state.processed_files,
-        "eta_seconds":  state.eta_seconds,
-    }
-
-
-@app.post("/scan")
-async def start_scan(
-    background_tasks: BackgroundTasks,
-    days: int = 180,
-    _: str = Depends(get_current_user),
-):
-    if state.is_scanning:
-        raise HTTPException(status_code=409, detail="Varredura já em curso.")
-    if days < 1 or days > 3650:
-        raise HTTPException(status_code=422, detail="Parâmetro 'days' deve estar entre 1 e 3650.")
-
-    state.is_scanning = True
-    state.progress    = 0.0
-    state.eta_seconds = 0
-    background_tasks.add_task(_run_and_store, days)
-    return {"message": f"Motor Sentinel iniciado (limiar: {days} dias)."}
-
-
-def _run_and_store(days: int):
-    try:
-        results = scanner_engine.run_full_scan(days, state)
-        database.save_scan_results(results)
-        database.log_action("SCAN_CONCLUÍDO", f"Dias: {days} | Encontrados: {len(results)}")
-    except Exception as e:
-        print(f"[SCAN] Erro crítico: {e}")
-        database.log_action("SCAN_ERRO", str(e), status="ERRO")
-    finally:
-        state.is_scanning = False
-        state.progress    = 100.0
-
-
 @app.get("/results")
 def get_results(_: str = Depends(get_current_user)):
-    return {"items": database.get_all_results()}
-
-
-@app.delete("/delete-item")
-async def delete_item(path: str, _: str = Depends(get_current_user)):
-    if not path.strip():
-        raise HTTPException(status_code=422, detail="Caminho inválido.")
-
-    success = database.delete_specific_file(path)
-    if not success:
-        raise HTTPException(status_code=404, detail="Item não encontrado no banco.")
-
-    # Tenta remover fisicamente (falha silenciosa se não tiver permissão)
-    if os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError as e:
-            print(f"[DELETE] Não foi possível remover do disco: {e}")
-
-    return {"message": "Item removido com sucesso."}
+    return {"items": database.get_cloud_results()}
 
 
 @app.get("/export/csv")
 def export_csv(_: str = Depends(get_current_user)):
-    """Exporta todos os resultados do último scan como arquivo CSV."""
-    items = database.get_all_results()
+    items = database.get_cloud_results()
     if not items:
         raise HTTPException(status_code=404, detail="Nenhum resultado para exportar.")
 
