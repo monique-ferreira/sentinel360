@@ -38,7 +38,7 @@ import bi_report
 
 MS_CLIENT_ID     = os.environ.get("MS_CLIENT_ID", "")
 MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
-MS_REDIRECT_URI  = os.environ.get("MS_REDIRECT_URI", "https://sentinel360.onrender.com/auth/microsoft/callback")
+MS_REDIRECT_URI  = os.environ.get("MS_REDIRECT_URI", "https://sentinel360-cyber.vercel.app/integrations")
 MS_SCOPES        = "Files.Read Sites.Read.All User.Read offline_access"
 FRONTEND_URL     = os.environ.get("FRONTEND_URL", "https://sentinel360-cyber.vercel.app")
 
@@ -427,8 +427,8 @@ async def get_bi_report(_: str = Depends(get_current_user)):
 # ── OAuth Microsoft — fluxo delegado (sem admin consent) ─────────────────────
 
 @app.get("/auth/microsoft/login")
-async def microsoft_login(state: str = "", _: str = Depends(get_current_user)):
-    """Retorna URL de autorização Microsoft. state deve conter o username do Sentinel."""
+async def microsoft_login(username: str = Depends(get_current_user)):
+    """Retorna URL de autorização Microsoft com username como state."""
     import urllib.parse
     params = urllib.parse.urlencode({
         "client_id":     MS_CLIENT_ID,
@@ -436,11 +436,54 @@ async def microsoft_login(state: str = "", _: str = Depends(get_current_user)):
         "redirect_uri":  MS_REDIRECT_URI,
         "scope":         MS_SCOPES,
         "response_mode": "query",
-        "state":         state,
+        "state":         username,
         "prompt":        "select_account",
     })
     url = f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?{params}"
     return {"auth_url": url}
+
+
+class MsExchangeBody(BaseModel):
+    code: str
+    state: str = ""
+
+@app.post("/auth/microsoft/exchange")
+async def microsoft_exchange(body: MsExchangeBody):
+    """Frontend manda o code recebido do OAuth; backend troca por token e salva."""
+    import requests as req
+    resp = req.post(
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        data={
+            "client_id":     MS_CLIENT_ID,
+            "client_secret": MS_CLIENT_SECRET,
+            "code":          body.code,
+            "redirect_uri":  MS_REDIRECT_URI,
+            "grant_type":    "authorization_code",
+        },
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Falha ao trocar code por token.")
+
+    tokens = resp.json()
+    access_token  = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+
+    me = req.get(
+        "https://graph.microsoft.com/v1.0/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    ).json()
+    ms_email = me.get("mail") or me.get("userPrincipalName", "")
+    ms_name  = me.get("displayName", "")
+
+    key = f"ms_personal_{body.state}" if body.state else "ms_personal"
+    database.save_integration_config(key, {
+        "type": "delegated", "access_token": access_token,
+        "refresh_token": refresh_token, "ms_email": ms_email, "ms_name": ms_name,
+    })
+    database.log_action("OAUTH_MS", f"Conta pessoal conectada: {ms_email}")
+    return {"connected": True, "ms_email": ms_email, "ms_name": ms_name}
 
 
 @app.get("/auth/microsoft/callback")
