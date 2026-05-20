@@ -22,9 +22,9 @@ import threading
 import time
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
 from pydantic import BaseModel, EmailStr
@@ -33,6 +33,14 @@ import auth_manager
 import database
 import ms_graph
 import bi_report
+
+# ── OAuth Microsoft (delegated) ───────────────────────────────────────────────
+
+MS_CLIENT_ID     = os.environ.get("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
+MS_REDIRECT_URI  = os.environ.get("MS_REDIRECT_URI", "https://sentinel360.onrender.com/auth/microsoft/callback")
+MS_SCOPES        = "Files.Read Sites.Read.All User.Read offline_access"
+FRONTEND_URL     = os.environ.get("FRONTEND_URL", "https://sentinel360-cyber.vercel.app")
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 
@@ -414,6 +422,126 @@ async def get_bi_report(_: str = Depends(get_current_user)):
     scan_history  = database.get_scan_history()
     html = bi_report.generate(local_items, cloud_items, scan_history)
     return HTMLResponse(content=html)
+
+
+# ── OAuth Microsoft — fluxo delegado (sem admin consent) ─────────────────────
+
+@app.get("/auth/microsoft/login")
+async def microsoft_login(state: str = "", _: str = Depends(get_current_user)):
+    """Retorna URL de autorização Microsoft. state deve conter o username do Sentinel."""
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        "client_id":     MS_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri":  MS_REDIRECT_URI,
+        "scope":         MS_SCOPES,
+        "response_mode": "query",
+        "state":         state,
+        "prompt":        "select_account",
+    })
+    url = f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?{params}"
+    return {"auth_url": url}
+
+
+@app.get("/auth/microsoft/callback")
+async def microsoft_callback(request: Request):
+    """Recebe o code do Microsoft, troca por token e redireciona para o frontend."""
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state", "")
+    error = request.query_params.get("error")
+
+    if error:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_error={error}")
+
+    if not code:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_error=no_code")
+
+    # Troca o code por access_token + refresh_token
+    import requests as req
+    resp = req.post(
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        data={
+            "client_id":     MS_CLIENT_ID,
+            "client_secret": MS_CLIENT_SECRET,
+            "code":          code,
+            "redirect_uri":  MS_REDIRECT_URI,
+            "grant_type":    "authorization_code",
+        },
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_error=token_exchange_failed")
+
+    tokens = resp.json()
+    access_token  = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+
+    # Busca info do usuário Microsoft
+    me = req.get(
+        "https://graph.microsoft.com/v1.0/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    ).json()
+    ms_email = me.get("mail") or me.get("userPrincipalName", "")
+    ms_name  = me.get("displayName", "")
+
+    # Salva token delegado no banco associado ao state (username Sentinel)
+    database.save_integration_config(f"ms_personal_{state}" if state else "ms_personal", {
+        "type":          "delegated",
+        "access_token":  access_token,
+        "refresh_token": refresh_token,
+        "ms_email":      ms_email,
+        "ms_name":       ms_name,
+    })
+    database.log_action("OAUTH_MS", f"Conta pessoal conectada: {ms_email}")
+
+    return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_connected=1&ms_email={ms_email}")
+
+
+@app.get("/auth/microsoft/status")
+async def microsoft_status(username: str = Depends(get_current_user)):
+    """Retorna se o usuário tem conta Microsoft conectada."""
+    config = database.get_integration_config(f"ms_personal_{username}")
+    if config and config.get("access_token"):
+        return {"connected": True, "ms_email": config.get("ms_email", ""), "ms_name": config.get("ms_name", "")}
+    return {"connected": False}
+
+
+@app.post("/integrations/personal/scan-files")
+async def scan_personal_files(days: int = 180, username: str = Depends(get_current_user)):
+    """Varre OneDrive pessoal usando token delegado do usuário."""
+    config = database.get_integration_config(f"ms_personal_{username}")
+    if not config or not config.get("access_token"):
+        raise HTTPException(status_code=404, detail="Conta Microsoft não conectada.")
+
+    if cloud_state.is_scanning:
+        raise HTTPException(status_code=409, detail="Varredura já em curso.")
+
+    cloud_state.is_scanning = True
+    cloud_state.progress    = 0.0
+    cloud_state.provider    = "personal"
+    cloud_state.error       = ""
+
+    token = config["access_token"]
+
+    def _run():
+        try:
+            results = ms_graph.scan_onedrive_personal(token, days_threshold=days)
+            database.save_cloud_results(f"personal_{username}", results)
+            database.log_action("SCAN_PERSONAL", f"OneDrive pessoal: {len(results)} itens")
+        except Exception as e:
+            cloud_state.error = str(e)
+        finally:
+            cloud_state.is_scanning = False
+            cloud_state.progress    = 100.0
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"message": "Varredura do OneDrive pessoal iniciada."}
+
+
+@app.get("/integrations/personal/file-results")
+async def personal_file_results(username: str = Depends(get_current_user)):
+    return {"items": database.get_cloud_results(f"personal_{username}")}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

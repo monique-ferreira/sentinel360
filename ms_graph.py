@@ -360,6 +360,25 @@ def scan_onedrive_files(
     return results
 
 
+# ── Varredura OneDrive pessoal (token delegado) ───────────────────────────────
+
+def scan_onedrive_personal(access_token: str, days_threshold: int = 180) -> list[dict]:
+    """
+    Varre o OneDrive do usuário autenticado via token delegado.
+    Não requer admin consent — acessa apenas os arquivos do próprio usuário.
+    """
+    results: list[dict] = []
+    counter = [0]
+    try:
+        drive_resp = _graph_get_single(access_token, f"{GRAPH_BASE}/me/drive")
+        drive_id = drive_resp["id"]
+        _walk_drive(access_token, drive_id, "root", "OneDrive Pessoal", "Meus Arquivos", days_threshold, results, counter)
+    except Exception as e:
+        print(f"[GRAPH] Erro ao varrer OneDrive pessoal: {e}")
+    print(f"[GRAPH] OneDrive pessoal: {len(results)} itens relevantes de {counter[0]} arquivos.")
+    return results
+
+
 # ── Auditoria de usuários ─────────────────────────────────────────────────────
 
 def audit_inactive_users_azure(
