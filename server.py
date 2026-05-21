@@ -267,7 +267,12 @@ class CloudScanState:
             rate = count / elapsed           # files/sec
             # Soft progress: asymptotic toward 99% so it never snaps to 100 prematurely
             self.progress = min(99.0, round(100 * (1 - 1 / (1 + count / 50)), 1))
-            self.eta_seconds = int(count / rate)  # time already spent = rough remaining estimate
+            progress_frac = 1 - 1 / (1 + count / 50)
+            if progress_frac > 0:
+                estimated_total = elapsed / progress_frac
+                self.eta_seconds = max(0, int(estimated_total - elapsed))
+            else:
+                self.eta_seconds = -1
 
     def finish(self):
         self.is_scanning = False
