@@ -755,7 +755,7 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
     ext  = ("." + nome.rsplit(".", 1)[-1].lower()) if "." in nome else ""
     mime = _MIME_MAP.get(ext, "")
     is_binary = bool(mime)
-    MAX_BYTES = 5 * 1024 * 1024 if is_binary else 50 * 1024
+    MAX_BYTES = 0 if is_binary else 50 * 1024  # 0 = sem limite para binários
 
     # ── Google Drive ──────────────────────────────────────────────────────────
     if drive_id == "gdrive":
@@ -783,11 +783,13 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
             )
             resp.raise_for_status()
             raw = b""
-            for chunk in resp.iter_content(chunk_size=MAX_BYTES):
+            chunk_size = MAX_BYTES if MAX_BYTES else 65536
+            for chunk in resp.iter_content(chunk_size=chunk_size):
                 raw += chunk
-                if len(raw) >= MAX_BYTES:
+                if MAX_BYTES and len(raw) >= MAX_BYTES:
                     break
-            raw = raw[:MAX_BYTES]
+            if MAX_BYTES:
+                raw = raw[:MAX_BYTES]
         except Exception:
             raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
 
@@ -813,11 +815,13 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
             )
             resp.raise_for_status()
             raw = b""
-            for chunk in resp.iter_content(chunk_size=MAX_BYTES):
+            chunk_size = MAX_BYTES if MAX_BYTES else 65536
+            for chunk in resp.iter_content(chunk_size=chunk_size):
                 raw += chunk
-                if len(raw) >= MAX_BYTES:
+                if MAX_BYTES and len(raw) >= MAX_BYTES:
                     break
-            raw = raw[:MAX_BYTES]
+            if MAX_BYTES:
+                raw = raw[:MAX_BYTES]
         except Exception:
             raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
 
@@ -828,7 +832,7 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
             "type": "binary",
             "mime": mime,
             "data": _b64.b64encode(raw).decode(),
-            "truncated": len(raw) >= MAX_BYTES,
+            "truncated": False,
         }
 
     return {
