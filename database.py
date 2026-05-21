@@ -206,13 +206,15 @@ def get_user_settings(owner: str) -> dict:
         if not user:
             return {}
         return {
-            "inactivity_days": user.get("inactivity_days", 180),
-            "account_type":    user.get("account_type", "personal"),
-            "org_id":          user.get("org_id"),
-            "org_role":        user.get("org_role"),
-            "org_status":      user.get("org_status"),
-            "full_name":       user.get("full_name"),
-            "email":           user.get("email"),
+            "inactivity_days":    user.get("inactivity_days", 180),
+            "account_type":       user.get("account_type", "personal"),
+            "org_id":             user.get("org_id"),
+            "org_role":           user.get("org_role"),
+            "org_status":         user.get("org_status"),
+            "full_name":          user.get("full_name"),
+            "email":              user.get("email"),
+            "auto_scan_interval": user.get("auto_scan_interval", "never"),
+            "last_auto_scan":     user.get("last_auto_scan"),
         }
     except Exception as e:
         print(f"[ERRO DB] get_user_settings: {e}")
@@ -221,7 +223,7 @@ def get_user_settings(owner: str) -> dict:
 
 def update_user_settings(owner: str, updates: dict) -> bool:
     try:
-        allowed = {"full_name", "email", "inactivity_days", "org_role"}
+        allowed = {"full_name", "email", "inactivity_days", "org_role", "auto_scan_interval"}
         safe = {k: v for k, v in updates.items() if k in allowed}
         if not safe:
             return False
@@ -230,6 +232,25 @@ def update_user_settings(owner: str, updates: dict) -> bool:
     except Exception as e:
         print(f"[ERRO DB] update_user_settings: {e}")
         return False
+
+
+def get_users_with_auto_scan() -> list[dict]:
+    """Returns users who have auto_scan_interval set (not 'never')."""
+    try:
+        return list(_col("users").find(
+            {"auto_scan_interval": {"$nin": ["never", None, ""]}},
+            {"_id": 0, "username": 1, "auto_scan_interval": 1, "last_auto_scan": 1},
+        ))
+    except Exception as e:
+        print(f"[ERRO DB] get_users_with_auto_scan: {e}")
+        return []
+
+
+def set_last_auto_scan(owner: str, ts: str) -> None:
+    try:
+        _col("users").update_one({"username": owner}, {"$set": {"last_auto_scan": ts}})
+    except Exception as e:
+        print(f"[ERRO DB] set_last_auto_scan: {e}")
 
 
 # ── organizations ──────────────────────────────────────────────────────────────

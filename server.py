@@ -22,6 +22,7 @@ Endpoints:
   Health:      GET /ping
 """
 
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -31,9 +32,13 @@ import secrets
 import threading
 import time
 import urllib.parse
+from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 import requests as req
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse
@@ -56,9 +61,90 @@ MS_SCOPES        = "Files.ReadWrite Sites.ReadWrite.All User.Read offline_access
 FRONTEND_URL     = os.environ.get("FRONTEND_URL", "https://sentinel360-cyber.vercel.app")
 VT_API_KEY       = os.environ.get("VT_API_KEY", "")
 
+# ── Scheduled scan ────────────────────────────────────────────────────────────
+
+_scheduler = AsyncIOScheduler()
+
+_INTERVAL_HOURS = {"daily": 24, "weekly": 168, "monthly": 720}
+
+
+async def _run_auto_scan(username: str):
+    """Fires a background scan for the user using whatever integration is connected."""
+    state = _get_scan_state(username)
+    if state.is_scanning:
+        return  # already running, skip this tick
+
+    settings  = database.get_user_settings(username)
+    days      = settings.get("inactivity_days", 180)
+
+    async def _do():
+        # Try MS365 first, then Azure, then personal
+        cfg365 = database.get_integration_config(username, "ms365")
+        cfgAzure = database.get_integration_config(username, "ms_azure")
+        cfgPersonal = database.get_integration_config(username, "ms_personal")
+
+        state.start("auto")
+        try:
+            results = []
+            if cfg365 and cfg365.get("client_secret"):
+                token = ms_graph._get_token(cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"])
+                results += ms_graph.scan_sharepoint_files(token, days_threshold=days, progress_cb=state.on_file)
+                results += ms_graph.scan_onedrive_files(token, days_threshold=days, progress_cb=state.on_file)
+            if cfgAzure and cfgAzure.get("client_secret"):
+                token = ms_graph._get_token(cfgAzure["tenant_id"], cfgAzure["client_id"], cfgAzure["client_secret"])
+                results += ms_graph.scan_onedrive_files(token, days_threshold=days, progress_cb=state.on_file)
+            if cfgPersonal and cfgPersonal.get("access_token"):
+                results += ms_graph.scan_onedrive_personal(cfgPersonal["access_token"], days_threshold=days, progress_cb=state.on_file)
+
+            if results:
+                database.save_cloud_results(username, "auto", results)
+                database.log_action("AUTO_SCAN", f"{len(results)} arquivos analisados", owner=username)
+        except Exception as e:
+            state.error = str(e)
+            print(f"[AUTO_SCAN] Erro para {username}: {e}")
+        finally:
+            state.finish()
+            database.set_last_auto_scan(username, datetime.utcnow().isoformat())
+
+    asyncio.create_task(_do())
+
+
+def _schedule_user(username: str, interval: str):
+    job_id = f"scan_{username}"
+    hours  = _INTERVAL_HOURS.get(interval)
+    if not hours:
+        return
+    if _scheduler.get_job(job_id):
+        _scheduler.remove_job(job_id)
+    _scheduler.add_job(
+        _run_auto_scan,
+        trigger=IntervalTrigger(hours=hours),
+        id=job_id,
+        args=[username],
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    print(f"[SCHEDULER] Agendado scan {interval} para {username}")
+
+
+def _unschedule_user(username: str):
+    job_id = f"scan_{username}"
+    if _scheduler.get_job(job_id):
+        _scheduler.remove_job(job_id)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    _scheduler.start()
+    # Load existing scheduled users from DB
+    for user in database.get_users_with_auto_scan():
+        _schedule_user(user["username"], user["auto_scan_interval"])
+    yield
+    _scheduler.shutdown(wait=False)
+
 # ── App & CORS ────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Sentinel360 API", version="2.1.0")
+app = FastAPI(title="Sentinel360 API", version="2.1.0", lifespan=lifespan)
 
 _DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 _ALLOWED_ORIGINS = ["https://sentinel360-cyber.vercel.app"]
@@ -91,6 +177,7 @@ class UpdateProfileBody(BaseModel):
     full_name: Optional[str] = None
     email: Optional[str] = None
     inactivity_days: Optional[int] = None
+    auto_scan_interval: Optional[str] = None  # "never" | "daily" | "weekly" | "monthly"
 
 
 class UserSettingsBody(BaseModel):
@@ -310,7 +397,9 @@ async def get_me(username: str = Depends(get_current_user)):
         "org_status":      settings.get("org_status"),
         "org_name":        org_name,
         "org_member_count": org_member_count,
-        "inactivity_days": settings.get("inactivity_days", 180),
+        "inactivity_days":    settings.get("inactivity_days", 180),
+        "auto_scan_interval": settings.get("auto_scan_interval", "never"),
+        "last_auto_scan":     settings.get("last_auto_scan"),
         "is_restricted": (
             settings.get("account_type") == "corporate"
             and settings.get("org_role") != "admin"
@@ -326,6 +415,13 @@ async def update_me(body: UpdateProfileBody, username: str = Depends(get_current
         if database.find_user_by_email(body.email):
             raise HTTPException(status_code=409, detail="Email já em uso.")
     database.update_user_settings(username, updates)
+    # Sync scheduler if auto_scan_interval changed
+    if "auto_scan_interval" in updates:
+        interval = updates["auto_scan_interval"]
+        if interval and interval != "never":
+            _schedule_user(username, interval)
+        else:
+            _unschedule_user(username)
     return {"message": "Perfil atualizado."}
 
 
