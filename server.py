@@ -38,7 +38,7 @@ from typing import Optional
 
 import requests as req
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse
@@ -64,8 +64,6 @@ VT_API_KEY       = os.environ.get("VT_API_KEY", "")
 # ── Scheduled scan ────────────────────────────────────────────────────────────
 
 _scheduler = AsyncIOScheduler()
-
-_INTERVAL_HOURS = {"daily": 24, "weekly": 168, "monthly": 720}
 
 
 async def _run_auto_scan(username: str):
@@ -109,22 +107,34 @@ async def _run_auto_scan(username: str):
     asyncio.create_task(_do())
 
 
-def _schedule_user(username: str, interval: str):
+def _schedule_user(username: str, interval: str, hour: int = 6, day: int = 1):
+    """
+    interval: daily | weekly | monthly
+    hour:     0-23 (local server time, UTC on Render)
+    day:      0-6 for weekly (0=Monday), 1-31 for monthly
+    """
     job_id = f"scan_{username}"
-    hours  = _INTERVAL_HOURS.get(interval)
-    if not hours:
-        return
     if _scheduler.get_job(job_id):
         _scheduler.remove_job(job_id)
+
+    if interval == "daily":
+        trigger = CronTrigger(hour=hour, minute=0)
+    elif interval == "weekly":
+        trigger = CronTrigger(day_of_week=day, hour=hour, minute=0)
+    elif interval == "monthly":
+        trigger = CronTrigger(day=day, hour=hour, minute=0)
+    else:
+        return
+
     _scheduler.add_job(
         _run_auto_scan,
-        trigger=IntervalTrigger(hours=hours),
+        trigger=trigger,
         id=job_id,
         args=[username],
         replace_existing=True,
         misfire_grace_time=3600,
     )
-    print(f"[SCHEDULER] Agendado scan {interval} para {username}")
+    print(f"[SCHEDULER] Agendado scan {interval} d={day} h={hour} para {username}")
 
 
 def _unschedule_user(username: str):
@@ -138,7 +148,12 @@ async def lifespan(app):
     _scheduler.start()
     # Load existing scheduled users from DB
     for user in database.get_users_with_auto_scan():
-        _schedule_user(user["username"], user["auto_scan_interval"])
+        _schedule_user(
+            user["username"],
+            user["auto_scan_interval"],
+            hour=user.get("auto_scan_hour", 6),
+            day=user.get("auto_scan_day", 1),
+        )
     yield
     _scheduler.shutdown(wait=False)
 
@@ -178,6 +193,8 @@ class UpdateProfileBody(BaseModel):
     email: Optional[str] = None
     inactivity_days: Optional[int] = None
     auto_scan_interval: Optional[str] = None  # "never" | "daily" | "weekly" | "monthly"
+    auto_scan_hour: Optional[int] = None       # 0-23
+    auto_scan_day:  Optional[int] = None       # 0-6 (weekly) or 1-31 (monthly)
 
 
 class UserSettingsBody(BaseModel):
@@ -399,6 +416,8 @@ async def get_me(username: str = Depends(get_current_user)):
         "org_member_count": org_member_count,
         "inactivity_days":    settings.get("inactivity_days", 180),
         "auto_scan_interval": settings.get("auto_scan_interval", "never"),
+        "auto_scan_hour":     settings.get("auto_scan_hour", 6),
+        "auto_scan_day":      settings.get("auto_scan_day", 1),
         "last_auto_scan":     settings.get("last_auto_scan"),
         "is_restricted": (
             settings.get("account_type") == "corporate"
@@ -416,10 +435,15 @@ async def update_me(body: UpdateProfileBody, username: str = Depends(get_current
             raise HTTPException(status_code=409, detail="Email já em uso.")
     database.update_user_settings(username, updates)
     # Sync scheduler if auto_scan_interval changed
-    if "auto_scan_interval" in updates:
-        interval = updates["auto_scan_interval"]
+    if "auto_scan_interval" in updates or "auto_scan_hour" in updates or "auto_scan_day" in updates:
+        fresh = database.get_user_settings(username)
+        interval = fresh.get("auto_scan_interval", "never")
         if interval and interval != "never":
-            _schedule_user(username, interval)
+            _schedule_user(
+                username, interval,
+                hour=int(fresh.get("auto_scan_hour", 6)),
+                day=int(fresh.get("auto_scan_day", 1)),
+            )
         else:
             _unschedule_user(username)
     return {"message": "Perfil atualizado."}
