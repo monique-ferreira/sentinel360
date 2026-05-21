@@ -532,6 +532,64 @@ async def delete_item(
     return {"deleted": True}
 
 
+@app.get("/file-preview")
+async def file_preview(path: str, target_username: str = "", username: str = Depends(get_current_user)):
+    """Retorna o conteúdo de texto de um arquivo via Microsoft Graph (primeiros 50 KB)."""
+    owner = username
+    if target_username and target_username != username:
+        # Admin visualizando arquivo de membro — verificar permissão
+        me = database.get_user_settings(username)
+        if not me or me.get("org_role") != "admin":
+            raise HTTPException(status_code=403, detail="Acesso negado.")
+        owner = target_username
+    all_items = database.get_cloud_results(owner=owner)
+    item = next((i for i in all_items if (i.get("caminho") or i.get("Caminho") or i.get("path")) == path), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado nos resultados.")
+
+    drive_id = item.get("graph_drive_id", "")
+    item_id  = item.get("graph_item_id", "")
+    if not drive_id or not item_id:
+        raise HTTPException(status_code=422, detail="IDs do OneDrive não disponíveis. Refaça o scan.")
+
+    cfg = database.get_integration_config(username, "ms_personal")
+    if cfg and cfg.get("access_token"):
+        access_token = cfg["access_token"]
+    else:
+        cfg365 = database.get_integration_config(username, "ms365")
+        if not cfg365:
+            raise HTTPException(status_code=400, detail="Nenhuma conta Microsoft conectada.")
+        access_token = ms_graph._get_token(
+            cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"]
+        )
+
+    try:
+        import requests as _req
+        resp = _req.get(
+            f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+            stream=True,
+        )
+        resp.raise_for_status()
+        MAX_BYTES = 50 * 1024
+        raw = b""
+        for chunk in resp.iter_content(chunk_size=MAX_BYTES):
+            raw += chunk
+            if len(raw) >= MAX_BYTES:
+                break
+        content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
+        truncated = len(raw) >= MAX_BYTES
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao ler o arquivo: {e}")
+
+    return {
+        "nome": item.get("nome") or item.get("Arquivo") or item.get("name", ""),
+        "content": content,
+        "truncated": truncated,
+    }
+
+
 @app.get("/export/csv")
 def export_csv(username: str = Depends(get_current_user)):
     require_not_restricted(username)
