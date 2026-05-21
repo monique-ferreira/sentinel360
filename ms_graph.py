@@ -121,8 +121,8 @@ def _graph_get_single(token: str, url: str) -> dict:
     return resp.json()
 
 
-def _download_content(token: str, download_url: str) -> tuple[str, str]:
-    """Baixa os primeiros MAX_FILE_BYTES do arquivo. Retorna (texto, sha256_hex)."""
+def _download_content(token: str, download_url: str) -> str:
+    """Baixa os primeiros MAX_FILE_BYTES do arquivo e retorna como texto."""
     try:
         resp = requests.get(
             download_url,
@@ -136,11 +136,23 @@ def _download_content(token: str, download_url: str) -> tuple[str, str]:
             raw += chunk
             if len(raw) >= MAX_FILE_BYTES:
                 break
-        raw = raw[:MAX_FILE_BYTES]
-        sha256 = hashlib.sha256(raw).hexdigest()
-        return raw.decode("utf-8", errors="ignore"), sha256
+        return raw[:MAX_FILE_BYTES].decode("utf-8", errors="ignore")
     except Exception:
-        return "", ""
+        return ""
+
+
+def _get_file_sha256(token: str, drive_id: str, item_id: str) -> str:
+    """Obtém SHA256 completo do arquivo via Graph API (sem baixar o conteúdo)."""
+    try:
+        resp = requests.get(
+            f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}?$select=file",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("file", {}).get("hashes", {}).get("sha256Hash", "").lower()
+    except Exception:
+        return ""
 
 
 # ── Helpers de data ────────────────────────────────────────────────────────────
@@ -183,7 +195,6 @@ def _analyze_item(
     is_inactive = days_ago >= days_threshold if days_ago >= 0 else False
 
     risks: list[str] = []
-    sha256 = ""
 
     # Detecta pelo nome
     if SENSITIVE_FILENAMES.search(name):
@@ -195,13 +206,20 @@ def _analyze_item(
         item.get("file", {}).get("downloadUrl") if item.get("file") else None
     )
     if ext in TEXT_EXT and 0 < size <= 2 * 1024 * 1024 and download_url:
-        content, sha256 = _download_content(token, download_url)
+        content = _download_content(token, download_url)
         for label, pattern in SENSITIVE_PATTERNS.items():
             if re.search(pattern, content) and label not in risks:
                 risks.append(label)
-    elif download_url and item.get("file", {}).get("hashes", {}).get("sha256Hash"):
-        # Para arquivos binários, usar o hash provido pelo Graph API (se disponível)
-        sha256 = item["file"]["hashes"]["sha256Hash"].lower()
+
+    # SHA256 completo: preferir hash do Graph API (sem download extra)
+    # Graph API fornece sha256Hash na propriedade file.hashes para todos os arquivos
+    sha256 = item.get("file", {}).get("hashes", {}).get("sha256Hash", "").lower()
+    if not sha256:
+        # Fallback: buscar via API separada (acontece quando o item veio de listagem resumida)
+        graph_item_id  = item.get("id", "")
+        graph_drive_id = item.get("parentReference", {}).get("driveId", "")
+        if graph_item_id and graph_drive_id:
+            sha256 = _get_file_sha256(token, graph_drive_id, graph_item_id)
 
     if not is_inactive and not risks:
         return None
