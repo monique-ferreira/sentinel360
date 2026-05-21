@@ -191,6 +191,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
     return username
 
 
+# ── Helper: restrict corporate members ───────────────────────────────────────
+
+def require_not_restricted(username: str):
+    s = database.get_user_settings(username)
+    if s.get("account_type") == "corporate" and s.get("org_role") != "admin" and s.get("org_status") == "approved":
+        raise HTTPException(status_code=403, detail="Acesso restrito para membros corporativos. Solicite acesso ao administrador.")
+
+
 # ── Endpoints de autenticação ─────────────────────────────────────────────────
 
 @app.post("/register", status_code=201)
@@ -254,6 +262,11 @@ async def get_me(username: str = Depends(get_current_user)):
         "org_name":        org_name,
         "org_member_count": org_member_count,
         "inactivity_days": settings.get("inactivity_days", 180),
+        "is_restricted": (
+            settings.get("account_type") == "corporate"
+            and settings.get("org_role") != "admin"
+            and settings.get("org_status") == "approved"
+        ),
     }
 
 
@@ -365,6 +378,94 @@ async def get_workspace(username: str = Depends(get_current_user)):
     return data
 
 
+@app.post("/orgs/members/{target_username}/promote")
+async def promote_to_admin(target_username: str, username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin" or settings.get("account_type") != "corporate":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem promover membros.")
+    target = database.get_user_settings(target_username)
+    if target.get("org_id") != settings.get("org_id"):
+        raise HTTPException(status_code=404, detail="Membro não encontrado na organização.")
+    database.update_user_settings(target_username, {"org_role": "admin"})
+    database.log_action("PROMOTE_ADMIN", f"{target_username} promovido a admin", owner=username)
+    return {"message": f"{target_username} agora é administrador."}
+
+
+@app.get("/workspace/member/{target_username}/results")
+async def workspace_member_results(target_username: str, username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores.")
+    target = database.get_user_settings(target_username)
+    if target.get("org_id") != settings.get("org_id"):
+        raise HTTPException(status_code=404, detail="Membro não encontrado na organização.")
+    return {"items": database.get_cloud_results(owner=target_username)}
+
+
+@app.post("/workspace/member/{target_username}/scan")
+async def workspace_member_scan(target_username: str, username: str = Depends(get_current_user)):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores.")
+    target_settings = database.get_user_settings(target_username)
+    if target_settings.get("org_id") != settings.get("org_id"):
+        raise HTTPException(status_code=404, detail="Membro não encontrado na organização.")
+
+    cfg = database.get_integration_config(username, "ms365")
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Configure as credenciais MS365 da organização primeiro.")
+
+    inactivity_days = target_settings.get("inactivity_days", 180)
+
+    def _run():
+        try:
+            results = ms_graph.scan_sharepoint_files(
+                cfg["tenant_id"], cfg["client_id"], cfg["client_secret"],
+                days_threshold=inactivity_days,
+            )
+            target_email = target_settings.get("email", "").lower()
+            if target_email:
+                filtered = [r for r in results if target_email in (r.get("origem", "") + r.get("caminho", "")).lower()]
+                if filtered:
+                    results = filtered
+            database.save_cloud_results(target_username, "ms365", results)
+            database.log_action("ADMIN_SCAN", f"Scan de {target_username} por admin {username}", owner=username)
+        except Exception as e:
+            print(f"[WORKSPACE SCAN] Erro: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"message": f"Scan iniciado para {target_username}."}
+
+
+@app.get("/workspace/bi-report")
+async def workspace_bi_report(username: str = Depends(get_current_user), target_username: str = ""):
+    settings = database.get_user_settings(username)
+    if settings.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores.")
+
+    if target_username:
+        target = database.get_user_settings(target_username)
+        if target.get("org_id") != settings.get("org_id"):
+            raise HTTPException(status_code=404, detail="Membro não encontrado na organização.")
+        items = database.get_cloud_results(owner=target_username)
+        label = target_username
+    else:
+        members = database.get_org_members(settings["org_id"])
+        items = []
+        for m in members:
+            items.extend(database.get_cloud_results(owner=m))
+        label = "geral"
+
+    history = database.get_scan_history(owner=target_username if target_username else username)
+    xlsx_bytes = bi_excel.generate(items, history)
+    filename = f"sentinel360_bi_{label}_{int(time.time())}.xlsx"
+    return StreamingResponse(
+        iter([xlsx_bytes]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.post("/login")
 async def login(body: LoginBody):
     user = database.find_user(body.username)
@@ -388,6 +489,7 @@ async def forgot_password(body: ForgotPasswordBody):
 
 @app.get("/results")
 def get_results(username: str = Depends(get_current_user)):
+    require_not_restricted(username)
     return {"items": database.get_cloud_results(owner=username)}
 
 
@@ -432,6 +534,7 @@ async def delete_item(
 
 @app.get("/export/csv")
 def export_csv(username: str = Depends(get_current_user)):
+    require_not_restricted(username)
     items = database.get_cloud_results(owner=username)
     if not items:
         raise HTTPException(status_code=404, detail="Nenhum resultado para exportar.")

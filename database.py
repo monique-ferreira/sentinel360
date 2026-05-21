@@ -158,7 +158,7 @@ def get_user_settings(owner: str) -> dict:
 
 def update_user_settings(owner: str, updates: dict) -> bool:
     try:
-        allowed = {"full_name", "email", "inactivity_days"}
+        allowed = {"full_name", "email", "inactivity_days", "org_role"}
         safe = {k: v for k, v in updates.items() if k in allowed}
         if not safe:
             return False
@@ -295,6 +295,7 @@ def get_workspace_data(org_id: str) -> dict:
                 "inactive_files": inactive,
                 "risky_files":   risky,
                 "storage_mb":    round(storage_mb, 2),
+                "inactivity_days": user.get("inactivity_days", 180) if user else 180,
             })
         return {"members": member_data, "total_members": len(members)}
     except Exception as e:
