@@ -51,6 +51,7 @@ MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
 MS_REDIRECT_URI  = os.environ.get("MS_REDIRECT_URI", "https://sentinel360-cyber.vercel.app/integrations")
 MS_SCOPES        = "Files.ReadWrite Sites.ReadWrite.All User.Read offline_access"
 FRONTEND_URL     = os.environ.get("FRONTEND_URL", "https://sentinel360-cyber.vercel.app")
+VT_API_KEY       = os.environ.get("VT_API_KEY", "")
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 
@@ -90,7 +91,6 @@ class UpdateProfileBody(BaseModel):
 
 class UserSettingsBody(BaseModel):
     inactivity_days: Optional[int] = None
-    vt_api_key: Optional[str] = None
 
 
 class CreateOrgBody(BaseModel):
@@ -284,13 +284,9 @@ async def update_me(body: UpdateProfileBody, username: str = Depends(get_current
 @app.get("/user/settings")
 async def get_user_settings_ep(username: str = Depends(get_current_user)):
     s = database.get_user_settings(username)
-    vt_key = s.get("vt_api_key", "")
-    # Mascarar a chave na resposta: mostrar só os últimos 4 chars
-    vt_key_masked = ("*" * (len(vt_key) - 4) + vt_key[-4:]) if len(vt_key) > 4 else ("*" * len(vt_key))
     return {
         "inactivity_days": s.get("inactivity_days", 180),
-        "vt_api_key_configured": bool(vt_key),
-        "vt_api_key_masked": vt_key_masked if vt_key else "",
+        "vt_configured": bool(VT_API_KEY),
     }
 
 
@@ -299,8 +295,6 @@ async def put_user_settings(body: UserSettingsBody, username: str = Depends(get_
     updates: dict = {}
     if body.inactivity_days is not None:
         updates["inactivity_days"] = body.inactivity_days
-    if body.vt_api_key is not None:
-        updates["vt_api_key"] = body.vt_api_key
     if updates:
         database.update_user_settings(username, updates)
     return {"message": "Configurações salvas.", **updates}
@@ -614,11 +608,8 @@ async def virustotal_check(path: str, target_username: str = "", username: str =
             raise HTTPException(status_code=403, detail="Acesso negado.")
         owner = target_username
 
-    # Buscar chave VT do usuário autenticado (sempre o admin ou dono)
-    settings = database.get_user_settings(username)
-    vt_key = settings.get("vt_api_key", "")
-    if not vt_key:
-        raise HTTPException(status_code=400, detail="Chave da API do VirusTotal não configurada. Acesse Perfil > Configurações para adicionar.")
+    if not VT_API_KEY:
+        raise HTTPException(status_code=503, detail="VirusTotal não configurado no servidor.")
 
     # Buscar hash do item no banco
     all_items = database.get_cloud_results(owner=owner)
@@ -630,18 +621,26 @@ async def virustotal_check(path: str, target_username: str = "", username: str =
     if not sha256:
         raise HTTPException(status_code=422, detail="Hash SHA256 não disponível para este arquivo. Refaça o scan para calculá-lo.")
 
+    # Verificar cache — se o hash já foi analisado, retornar direto
+    cached = database.get_vt_cache(sha256)
+    if cached:
+        cached.pop("cached_at", None)
+        return {**cached, "from_cache": True}
+
     import requests as _req
     try:
         resp = _req.get(
             f"https://www.virustotal.com/api/v3/files/{sha256}",
-            headers={"x-apikey": vt_key},
+            headers={"x-apikey": VT_API_KEY},
             timeout=15,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Falha ao contatar VirusTotal: {e}")
 
     if resp.status_code == 404:
-        return {"status": "not_found", "sha256": sha256, "message": "Arquivo não encontrado na base do VirusTotal."}
+        result = {"status": "not_found", "sha256": sha256}
+        database.set_vt_cache(sha256, result)
+        return result
     if resp.status_code == 401:
         raise HTTPException(status_code=401, detail="Chave da API do VirusTotal inválida.")
     if resp.status_code == 429:
@@ -653,18 +652,13 @@ async def virustotal_check(path: str, target_username: str = "", username: str =
     stats = data.get("last_analysis_stats", {})
     engines = data.get("last_analysis_results", {})
 
-    # Apenas engines que detectaram algo
     detections = [
-        {
-            "engine": name,
-            "category": res.get("category"),
-            "result": res.get("result"),
-        }
+        {"engine": name, "category": res.get("category"), "result": res.get("result")}
         for name, res in engines.items()
         if res.get("category") in ("malicious", "suspicious")
     ]
 
-    return {
+    result = {
         "status": "found",
         "sha256": sha256,
         "meaningful_name": data.get("meaningful_name", ""),
@@ -674,7 +668,10 @@ async def virustotal_check(path: str, target_username: str = "", username: str =
         "threat_names": data.get("threat_names", []) or list({d["result"] for d in detections if d["result"]}),
         "vt_link": f"https://www.virustotal.com/gui/file/{sha256}",
         "analysis_date": data.get("last_analysis_date"),
+        "from_cache": False,
     }
+    database.set_vt_cache(sha256, result)
+    return result
 
 
 @app.get("/export/csv")

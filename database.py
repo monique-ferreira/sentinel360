@@ -82,6 +82,29 @@ def delete_cloud_result(owner: str, caminho: str) -> bool:
         return False
 
 
+# ── VirusTotal cache ──────────────────────────────────────────────────────────
+
+def get_vt_cache(sha256: str) -> dict | None:
+    """Retorna resultado VT cacheado para o hash, ou None se não existir."""
+    try:
+        return _col("vt_cache").find_one({"sha256": sha256}, {"_id": 0})
+    except Exception as e:
+        print(f"[ERRO DB] get_vt_cache: {e}")
+        return None
+
+
+def set_vt_cache(sha256: str, result: dict) -> None:
+    """Salva/atualiza resultado VT para o hash."""
+    try:
+        _col("vt_cache").update_one(
+            {"sha256": sha256},
+            {"$set": {**result, "sha256": sha256, "cached_at": datetime.utcnow().isoformat()}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[ERRO DB] set_vt_cache: {e}")
+
+
 # ── users ─────────────────────────────────────────────────────────────────────
 
 def find_user(username: str) -> dict | None:
