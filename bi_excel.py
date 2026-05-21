@@ -224,28 +224,29 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
         pie = PieChart()
         pie.title  = "Categorias de Risco"
         pie.style  = 2
-        pie.width  = 16
-        pie.height = 12
+        pie.width  = 18
+        pie.height = 14
         data_ref   = Reference(ws_charts, min_col=2, min_row=pie_data_row_start - 1,
                                 max_row=pie_data_row_start + len(risk_list) - 1)
         labels_ref = Reference(ws_charts, min_col=1, min_row=pie_data_row_start,
                                 max_row=pie_data_row_start + len(risk_list) - 1)
         pie.add_data(data_ref, titles_from_data=True)
         pie.set_categories(labels_ref)
-        ws_charts.add_chart(pie, "D2")
+        ws_charts.add_chart(pie, "D2")   # pizza: D2, ocupa ~24 linhas
 
-    # ── Dados para gráfico de barras: histórico (cols A-C a partir da linha pie_end + 2)
+    # ── Dados para gráfico de barras: histórico — cols A-C fixas abaixo dos dados da pizza
+    # Posição fixa na linha 30 para garantir que não sobreponha a pizza (que ocupa D2:M25)
+    BAR_DATA_ROW = 30
     hist_slice = list(reversed(scan_history[:10]))
-    bar_row_start = pie_data_row_start + len(risk_list) + 3 if risk_list else pie_data_row_start + 3
 
     if hist_slice:
-        ws_charts.cell(row=bar_row_start - 1, column=1, value="Data").font = _font(bold=True)
-        ws_charts.cell(row=bar_row_start - 1, column=2, value="Total").font = _font(bold=True)
-        ws_charts.cell(row=bar_row_start - 1, column=3, value="Com Risco").font = _font(bold=True)
+        ws_charts.cell(row=BAR_DATA_ROW - 1, column=1, value="Data").font = _font(bold=True)
+        ws_charts.cell(row=BAR_DATA_ROW - 1, column=2, value="Total").font = _font(bold=True)
+        ws_charts.cell(row=BAR_DATA_ROW - 1, column=3, value="Com Risco").font = _font(bold=True)
         for h_i, hh in enumerate(hist_slice):
-            ws_charts.cell(row=bar_row_start + h_i, column=1, value=hh.get("data", "")[:10])
-            ws_charts.cell(row=bar_row_start + h_i, column=2, value=hh.get("total_arquivos", 0))
-            ws_charts.cell(row=bar_row_start + h_i, column=3, value=hh.get("com_risco", 0))
+            ws_charts.cell(row=BAR_DATA_ROW + h_i, column=1, value=hh.get("data", "")[:10])
+            ws_charts.cell(row=BAR_DATA_ROW + h_i, column=2, value=hh.get("total_arquivos", 0))
+            ws_charts.cell(row=BAR_DATA_ROW + h_i, column=3, value=hh.get("com_risco", 0))
 
         bar = BarChart()
         bar.type    = "col"
@@ -253,16 +254,15 @@ def generate(cloud_items: list[dict], scan_history: list[dict]) -> bytes:
         bar.y_axis.title = "Arquivos"
         bar.x_axis.title = "Data"
         bar.style   = 2
-        bar.width   = 20
-        bar.height  = 12
+        bar.width   = 22
+        bar.height  = 14
         data_ref = Reference(ws_charts, min_col=2, max_col=3,
-                             min_row=bar_row_start - 1, max_row=bar_row_start + len(hist_slice) - 1)
+                             min_row=BAR_DATA_ROW - 1, max_row=BAR_DATA_ROW + len(hist_slice) - 1)
         cats_ref = Reference(ws_charts, min_col=1,
-                             min_row=bar_row_start, max_row=bar_row_start + len(hist_slice) - 1)
+                             min_row=BAR_DATA_ROW, max_row=BAR_DATA_ROW + len(hist_slice) - 1)
         bar.add_data(data_ref, titles_from_data=True)
         bar.set_categories(cats_ref)
-        anchor_row = bar_row_start + len(hist_slice) + 2
-        ws_charts.add_chart(bar, f"D{anchor_row}")
+        ws_charts.add_chart(bar, "D28")  # barras: D28, logo abaixo da pizza
 
     buf = io.BytesIO()
     wb.save(buf)
