@@ -16,19 +16,32 @@ if _ENCRYPTION_KEY:
     except Exception as _e:
         print(f"[WARN DB] Fernet init failed: {_e} — credentials will be stored unencrypted")
 
-_ENCRYPTED_FIELDS = {"client_secret", "access_token", "refresh_token"}
+_ENCRYPTED_FIELDS = {"client_secret", "access_token", "refresh_token", "service_account_json"}
 
 
-def _encrypt(value: str) -> str:
-    if _fernet and isinstance(value, str):
+def _encrypt(value) -> str:
+    if not _fernet:
+        return value
+    if isinstance(value, dict):
+        import json
+        return "enc:" + _fernet.encrypt(json.dumps(value).encode()).decode()
+    if isinstance(value, str):
         return "enc:" + _fernet.encrypt(value.encode()).decode()
     return value
 
 
-def _decrypt(value: str) -> str:
-    if _fernet and isinstance(value, str) and value.startswith("enc:"):
-        return _fernet.decrypt(value[4:].encode()).decode()
-    return value
+def _decrypt(value):
+    if not _fernet or not isinstance(value, str) or not value.startswith("enc:"):
+        return value
+    try:
+        raw = _fernet.decrypt(value[4:].encode()).decode()
+        import json
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    except Exception:
+        return value
 
 
 def _encrypt_config(config: dict) -> dict:
@@ -38,8 +51,7 @@ def _encrypt_config(config: dict) -> dict:
 def _decrypt_config(config: dict) -> dict:
     if not config:
         return config
-    return {k: (_decrypt(v) if k in _ENCRYPTED_FIELDS and isinstance(v, str) else v)
-            for k, v in config.items()}
+    return {k: (_decrypt(v) if k in _ENCRYPTED_FIELDS else v) for k, v in config.items()}
 
 MONGO_URI = os.environ.get("MONGO_URI")
 

@@ -13,3 +13,4 @@ python-dotenv
 openpyxl>=3.1.0
 apscheduler>=3.10
 cryptography
+google-auth

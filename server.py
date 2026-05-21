@@ -49,6 +49,7 @@ from pydantic import BaseModel
 import auth_manager
 import database
 import ms_graph
+import google_drive
 import bi_report
 import bi_excel
 
@@ -60,6 +61,12 @@ MS_REDIRECT_URI  = os.environ.get("MS_REDIRECT_URI", "https://sentinel360-cyber.
 MS_SCOPES        = "Files.ReadWrite Sites.ReadWrite.All User.Read offline_access"
 FRONTEND_URL     = os.environ.get("FRONTEND_URL", "https://sentinel360-cyber.vercel.app")
 VT_API_KEY       = os.environ.get("VT_API_KEY", "")
+
+# ── OAuth Google ──────────────────────────────────────────────────────────────
+
+GCP_CLIENT_ID       = os.environ.get("GCP_CLIENT_ID", "")
+GCP_CLIENT_SECRET   = os.environ.get("GCP_CLIENT_SECRET", "")
+GCP_REDIRECT_URI    = os.environ.get("GCP_REDIRECT_URI", "https://sentinel360-cyber.vercel.app/integrations")
 
 # ── Scheduled scan ────────────────────────────────────────────────────────────
 
@@ -1203,6 +1210,172 @@ async def get_bi_report(username: str = Depends(get_current_user)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── Google Drive OAuth ────────────────────────────────────────────────────────
+
+class GdriveConfigBody(BaseModel):
+    service_account_json: dict  # JSON do service account para Workspace
+
+@app.get("/auth/google/login")
+async def google_login(username: str = Depends(get_current_user)):
+    if not GCP_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google OAuth não configurado no servidor.")
+    state_nonce = _create_oauth_state(username)
+    url = google_drive.get_auth_url(GCP_CLIENT_ID, GCP_REDIRECT_URI, state=state_nonce)
+    return {"auth_url": url}
+
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request):
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state", "")
+    error = request.query_params.get("error")
+
+    if error:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?gdrive_error={error}")
+    if not code:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?gdrive_error=no_code")
+
+    nonce_owner = _consume_oauth_state(state)
+    if not nonce_owner:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?gdrive_error=invalid_state")
+
+    try:
+        tokens = google_drive.exchange_code(GCP_CLIENT_ID, GCP_CLIENT_SECRET, GCP_REDIRECT_URI, code)
+    except Exception:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?gdrive_error=token_exchange_failed")
+
+    access_token  = tokens.get("access_token", "")
+    refresh_token = tokens.get("refresh_token", "")
+
+    try:
+        info = google_drive.get_user_info(access_token)
+        gdrive_email = info.get("email", "")
+        gdrive_name  = info.get("name", "")
+    except Exception:
+        gdrive_email = ""
+        gdrive_name  = ""
+
+    database.save_integration_config(nonce_owner, "google_personal", {
+        "type":          "delegated",
+        "access_token":  access_token,
+        "refresh_token": refresh_token,
+        "gdrive_email":  gdrive_email,
+        "gdrive_name":   gdrive_name,
+    })
+    database.log_action("OAUTH_GOOGLE", f"Google Drive pessoal conectado: {gdrive_email}", owner=nonce_owner)
+    return RedirectResponse(f"{FRONTEND_URL}/integrations?gdrive_connected=1")
+
+
+@app.get("/auth/google/status")
+async def google_status(username: str = Depends(get_current_user)):
+    config = database.get_integration_config(username, "google_personal")
+    if config and config.get("access_token"):
+        return {"connected": True, "gdrive_email": config.get("gdrive_email", ""), "gdrive_name": config.get("gdrive_name", "")}
+    return {"connected": False}
+
+
+@app.post("/integrations/google-workspace/configure")
+async def configure_google_workspace(body: GdriveConfigBody, username: str = Depends(get_current_user)):
+    me = database.get_user_settings(username)
+    if me.get("account_type") != "corporate" or me.get("org_role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admins corporativos podem configurar o Workspace.")
+    result = google_drive.test_service_account(body.service_account_json)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=f"Credenciais inválidas: {result['error']}")
+    database.save_integration_config(username, "google_workspace", {
+        "type":                 "service_account",
+        "service_account_json": body.service_account_json,
+    })
+    return {"message": "Google Workspace configurado com sucesso."}
+
+
+@app.get("/integrations/google-workspace/status")
+async def google_workspace_status(username: str = Depends(get_current_user)):
+    config = database.get_integration_config(username, "google_workspace")
+    if config and config.get("service_account_json"):
+        sa = config["service_account_json"]
+        return {"connected": True, "client_email": sa.get("client_email", "")}
+    return {"connected": False}
+
+
+@app.post("/integrations/google/scan-files")
+async def scan_google_files(
+    provider: str = "personal",  # "personal" | "workspace"
+    days: int = 180,
+    username: str = Depends(get_current_user),
+):
+    state = _get_scan_state(username)
+    if state.is_scanning:
+        raise HTTPException(status_code=409, detail="Varredura já em curso.")
+
+    if provider == "workspace":
+        me = database.get_user_settings(username)
+        if me.get("account_type") != "corporate" or me.get("org_role") != "admin":
+            raise HTTPException(status_code=403, detail="Apenas admins corporativos.")
+        cfg = database.get_integration_config(username, "google_workspace")
+        if not cfg or not cfg.get("service_account_json"):
+            raise HTTPException(status_code=400, detail="Google Workspace não configurado.")
+
+        def _run_workspace():
+            state.start("google_workspace")
+            try:
+                result = google_drive.test_service_account(cfg["service_account_json"])
+                if not result["ok"]:
+                    state.error = "Credenciais do service account inválidas."
+                    return
+                access_token = result["token"]
+                results = google_drive.scan_drive_files(access_token, days_threshold=days, progress_cb=state.on_file, shared_drives=True)
+                database.save_cloud_results(username, "google_workspace", results)
+                database.log_action("SCAN_GOOGLE_WS", f"{len(results)} arquivos analisados", owner=username)
+            except Exception as e:
+                state.error = str(e)
+            finally:
+                state.finish()
+
+        threading.Thread(target=_run_workspace, daemon=True).start()
+        return {"status": "started"}
+
+    # personal
+    cfg = database.get_integration_config(username, "google_personal")
+    if not cfg or not cfg.get("access_token"):
+        raise HTTPException(status_code=400, detail="Google Drive pessoal não conectado.")
+
+    def _run_personal():
+        state.start("google_personal")
+        try:
+            access_token = cfg["access_token"]
+            # Try to refresh if needed
+            if cfg.get("refresh_token") and GCP_CLIENT_ID:
+                try:
+                    access_token = google_drive.refresh_access_token(GCP_CLIENT_ID, GCP_CLIENT_SECRET, cfg["refresh_token"])
+                    database.save_integration_config(username, "google_personal", {**cfg, "access_token": access_token})
+                except Exception:
+                    pass  # use existing token
+            results = google_drive.scan_drive_files(access_token, days_threshold=days, progress_cb=state.on_file, shared_drives=False)
+            database.save_cloud_results(username, "google_personal", results)
+            database.log_action("SCAN_GOOGLE", f"{len(results)} arquivos analisados", owner=username)
+        except Exception as e:
+            state.error = str(e)
+        finally:
+            state.finish()
+
+    threading.Thread(target=_run_personal, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/integrations/google/scan-status")
+async def google_scan_status(username: str = Depends(get_current_user)):
+    state = _get_scan_state(username)
+    return {
+        "is_scanning":     state.is_scanning,
+        "progress":        state.progress,
+        "processed_files": state.processed_files,
+        "eta_seconds":     state.eta_seconds,
+        "error":           state.error,
+        "provider":        state.provider,
+    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
