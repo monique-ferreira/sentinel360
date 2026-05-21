@@ -89,7 +89,8 @@ class UpdateProfileBody(BaseModel):
 
 
 class UserSettingsBody(BaseModel):
-    inactivity_days: int
+    inactivity_days: Optional[int] = None
+    vt_api_key: Optional[str] = None
 
 
 class CreateOrgBody(BaseModel):
@@ -283,13 +284,26 @@ async def update_me(body: UpdateProfileBody, username: str = Depends(get_current
 @app.get("/user/settings")
 async def get_user_settings_ep(username: str = Depends(get_current_user)):
     s = database.get_user_settings(username)
-    return {"inactivity_days": s.get("inactivity_days", 180)}
+    vt_key = s.get("vt_api_key", "")
+    # Mascarar a chave na resposta: mostrar só os últimos 4 chars
+    vt_key_masked = ("*" * (len(vt_key) - 4) + vt_key[-4:]) if len(vt_key) > 4 else ("*" * len(vt_key))
+    return {
+        "inactivity_days": s.get("inactivity_days", 180),
+        "vt_api_key_configured": bool(vt_key),
+        "vt_api_key_masked": vt_key_masked if vt_key else "",
+    }
 
 
 @app.put("/user/settings")
 async def put_user_settings(body: UserSettingsBody, username: str = Depends(get_current_user)):
-    database.update_user_settings(username, {"inactivity_days": body.inactivity_days})
-    return {"message": "Configurações salvas.", "inactivity_days": body.inactivity_days}
+    updates: dict = {}
+    if body.inactivity_days is not None:
+        updates["inactivity_days"] = body.inactivity_days
+    if body.vt_api_key is not None:
+        updates["vt_api_key"] = body.vt_api_key
+    if updates:
+        database.update_user_settings(username, updates)
+    return {"message": "Configurações salvas.", **updates}
 
 
 # ── Orgs ──────────────────────────────────────────────────────────────────────
@@ -587,6 +601,79 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
         "nome": item.get("nome") or item.get("Arquivo") or item.get("name", ""),
         "content": content,
         "truncated": truncated,
+    }
+
+
+@app.get("/virustotal/check")
+async def virustotal_check(path: str, target_username: str = "", username: str = Depends(get_current_user)):
+    """Verifica o hash SHA256 de um arquivo no VirusTotal."""
+    owner = username
+    if target_username and target_username != username:
+        me = database.get_user_settings(username)
+        if not me or me.get("org_role") != "admin":
+            raise HTTPException(status_code=403, detail="Acesso negado.")
+        owner = target_username
+
+    # Buscar chave VT do usuário autenticado (sempre o admin ou dono)
+    settings = database.get_user_settings(username)
+    vt_key = settings.get("vt_api_key", "")
+    if not vt_key:
+        raise HTTPException(status_code=400, detail="Chave da API do VirusTotal não configurada. Acesse Perfil > Configurações para adicionar.")
+
+    # Buscar hash do item no banco
+    all_items = database.get_cloud_results(owner=owner)
+    item = next((i for i in all_items if (i.get("caminho") or i.get("Caminho") or i.get("path")) == path), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado nos resultados.")
+
+    sha256 = item.get("sha256", "")
+    if not sha256:
+        raise HTTPException(status_code=422, detail="Hash SHA256 não disponível para este arquivo. Refaça o scan para calculá-lo.")
+
+    import requests as _req
+    try:
+        resp = _req.get(
+            f"https://www.virustotal.com/api/v3/files/{sha256}",
+            headers={"x-apikey": vt_key},
+            timeout=15,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao contatar VirusTotal: {e}")
+
+    if resp.status_code == 404:
+        return {"status": "not_found", "sha256": sha256, "message": "Arquivo não encontrado na base do VirusTotal."}
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="Chave da API do VirusTotal inválida.")
+    if resp.status_code == 429:
+        raise HTTPException(status_code=429, detail="Limite de requisições do VirusTotal atingido. Aguarde 1 minuto.")
+    if not resp.ok:
+        raise HTTPException(status_code=502, detail=f"VirusTotal retornou {resp.status_code}.")
+
+    data = resp.json().get("data", {}).get("attributes", {})
+    stats = data.get("last_analysis_stats", {})
+    engines = data.get("last_analysis_results", {})
+
+    # Apenas engines que detectaram algo
+    detections = [
+        {
+            "engine": name,
+            "category": res.get("category"),
+            "result": res.get("result"),
+        }
+        for name, res in engines.items()
+        if res.get("category") in ("malicious", "suspicious")
+    ]
+
+    return {
+        "status": "found",
+        "sha256": sha256,
+        "meaningful_name": data.get("meaningful_name", ""),
+        "type_description": data.get("type_description", ""),
+        "stats": stats,
+        "detections": detections,
+        "threat_names": data.get("threat_names", []) or list({d["result"] for d in detections if d["result"]}),
+        "vt_link": f"https://www.virustotal.com/gui/file/{sha256}",
+        "analysis_date": data.get("last_analysis_date"),
     }
 
 

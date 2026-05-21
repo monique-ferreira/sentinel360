@@ -10,6 +10,7 @@ Funções:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from datetime import datetime, timezone
@@ -120,8 +121,8 @@ def _graph_get_single(token: str, url: str) -> dict:
     return resp.json()
 
 
-def _download_content(token: str, download_url: str) -> str:
-    """Baixa os primeiros MAX_FILE_BYTES do arquivo e retorna como texto."""
+def _download_content(token: str, download_url: str) -> tuple[str, str]:
+    """Baixa os primeiros MAX_FILE_BYTES do arquivo. Retorna (texto, sha256_hex)."""
     try:
         resp = requests.get(
             download_url,
@@ -135,9 +136,11 @@ def _download_content(token: str, download_url: str) -> str:
             raw += chunk
             if len(raw) >= MAX_FILE_BYTES:
                 break
-        return raw[:MAX_FILE_BYTES].decode("utf-8", errors="ignore")
+        raw = raw[:MAX_FILE_BYTES]
+        sha256 = hashlib.sha256(raw).hexdigest()
+        return raw.decode("utf-8", errors="ignore"), sha256
     except Exception:
-        return ""
+        return "", ""
 
 
 # ── Helpers de data ────────────────────────────────────────────────────────────
@@ -180,6 +183,7 @@ def _analyze_item(
     is_inactive = days_ago >= days_threshold if days_ago >= 0 else False
 
     risks: list[str] = []
+    sha256 = ""
 
     # Detecta pelo nome
     if SENSITIVE_FILENAMES.search(name):
@@ -191,10 +195,13 @@ def _analyze_item(
         item.get("file", {}).get("downloadUrl") if item.get("file") else None
     )
     if ext in TEXT_EXT and 0 < size <= 2 * 1024 * 1024 and download_url:
-        content = _download_content(token, download_url)
+        content, sha256 = _download_content(token, download_url)
         for label, pattern in SENSITIVE_PATTERNS.items():
             if re.search(pattern, content) and label not in risks:
                 risks.append(label)
+    elif download_url and item.get("file", {}).get("hashes", {}).get("sha256Hash"):
+        # Para arquivos binários, usar o hash provido pelo Graph API (se disponível)
+        sha256 = item["file"]["hashes"]["sha256Hash"].lower()
 
     if not is_inactive and not risks:
         return None
@@ -211,6 +218,7 @@ def _analyze_item(
         "ultimo_acesso":   last_accessed[:10] if last_accessed else "",
         "graph_item_id":   item.get("id", ""),
         "graph_drive_id":  item.get("parentReference", {}).get("driveId", ""),
+        "sha256":          sha256,
     }
 
 
