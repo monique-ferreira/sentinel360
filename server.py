@@ -107,7 +107,7 @@ async def _run_auto_scan(username: str):
     asyncio.create_task(_do())
 
 
-def _schedule_user(username: str, interval: str, hour: int = 6, day: int = 1):
+def _schedule_user(username: str, interval: str, hour: int = 6, minute: int = 0, day: int = 1):
     """
     interval: daily | weekly | monthly
     hour:     0-23 (local server time, UTC on Render)
@@ -118,11 +118,11 @@ def _schedule_user(username: str, interval: str, hour: int = 6, day: int = 1):
         _scheduler.remove_job(job_id)
 
     if interval == "daily":
-        trigger = CronTrigger(hour=hour, minute=0)
+        trigger = CronTrigger(hour=hour, minute=minute)
     elif interval == "weekly":
-        trigger = CronTrigger(day_of_week=day, hour=hour, minute=0)
+        trigger = CronTrigger(day_of_week=day, hour=hour, minute=minute)
     elif interval == "monthly":
-        trigger = CronTrigger(day=day, hour=hour, minute=0)
+        trigger = CronTrigger(day=day, hour=hour, minute=minute)
     else:
         return
 
@@ -134,7 +134,7 @@ def _schedule_user(username: str, interval: str, hour: int = 6, day: int = 1):
         replace_existing=True,
         misfire_grace_time=3600,
     )
-    print(f"[SCHEDULER] Agendado scan {interval} d={day} h={hour} para {username}")
+    print(f"[SCHEDULER] Agendado scan {interval} d={day} {hour:02d}:{minute:02d} para {username}")
 
 
 def _unschedule_user(username: str):
@@ -152,6 +152,7 @@ async def lifespan(app):
             user["username"],
             user["auto_scan_interval"],
             hour=user.get("auto_scan_hour", 6),
+            minute=user.get("auto_scan_minute", 0),
             day=user.get("auto_scan_day", 1),
         )
     yield
@@ -193,8 +194,9 @@ class UpdateProfileBody(BaseModel):
     email: Optional[str] = None
     inactivity_days: Optional[int] = None
     auto_scan_interval: Optional[str] = None  # "never" | "daily" | "weekly" | "monthly"
-    auto_scan_hour: Optional[int] = None       # 0-23
-    auto_scan_day:  Optional[int] = None       # 0-6 (weekly) or 1-31 (monthly)
+    auto_scan_hour:   Optional[int] = None  # 0-23
+    auto_scan_minute: Optional[int] = None  # 0-59
+    auto_scan_day:    Optional[int] = None  # 0-6 (weekly) or 1-31 (monthly)
 
 
 class UserSettingsBody(BaseModel):
@@ -417,6 +419,7 @@ async def get_me(username: str = Depends(get_current_user)):
         "inactivity_days":    settings.get("inactivity_days", 180),
         "auto_scan_interval": settings.get("auto_scan_interval", "never"),
         "auto_scan_hour":     settings.get("auto_scan_hour", 6),
+        "auto_scan_minute":   settings.get("auto_scan_minute", 0),
         "auto_scan_day":      settings.get("auto_scan_day", 1),
         "last_auto_scan":     settings.get("last_auto_scan"),
         "is_restricted": (
@@ -442,6 +445,7 @@ async def update_me(body: UpdateProfileBody, username: str = Depends(get_current
             _schedule_user(
                 username, interval,
                 hour=int(fresh.get("auto_scan_hour", 6)),
+                minute=int(fresh.get("auto_scan_minute", 0)),
                 day=int(fresh.get("auto_scan_day", 1)),
             )
         else:

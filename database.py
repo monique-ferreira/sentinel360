@@ -215,6 +215,7 @@ def get_user_settings(owner: str) -> dict:
             "email":              user.get("email"),
             "auto_scan_interval": user.get("auto_scan_interval", "never"),
             "auto_scan_hour":     user.get("auto_scan_hour", 6),
+            "auto_scan_minute":   user.get("auto_scan_minute", 0),
             "auto_scan_day":      user.get("auto_scan_day", 1),
             "last_auto_scan":     user.get("last_auto_scan"),
         }
@@ -225,7 +226,7 @@ def get_user_settings(owner: str) -> dict:
 
 def update_user_settings(owner: str, updates: dict) -> bool:
     try:
-        allowed = {"full_name", "email", "inactivity_days", "org_role", "auto_scan_interval", "auto_scan_hour", "auto_scan_day"}
+        allowed = {"full_name", "email", "inactivity_days", "org_role", "auto_scan_interval", "auto_scan_hour", "auto_scan_minute", "auto_scan_day"}
         safe = {k: v for k, v in updates.items() if k in allowed}
         if not safe:
             return False
@@ -241,7 +242,7 @@ def get_users_with_auto_scan() -> list[dict]:
     try:
         return list(_col("users").find(
             {"auto_scan_interval": {"$nin": ["never", None, ""]}},
-            {"_id": 0, "username": 1, "auto_scan_interval": 1, "auto_scan_hour": 1, "auto_scan_day": 1, "last_auto_scan": 1},
+            {"_id": 0, "username": 1, "auto_scan_interval": 1, "auto_scan_hour": 1, "auto_scan_minute": 1, "auto_scan_day": 1, "last_auto_scan": 1},
         ))
     except Exception as e:
         print(f"[ERRO DB] get_users_with_auto_scan: {e}")
