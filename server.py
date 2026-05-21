@@ -725,9 +725,15 @@ async def delete_item(
     return {"deleted": True}
 
 
+_MIME_MAP = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".svg": "image/svg+xml", ".pdf": "application/pdf",
+}
+
 @app.get("/file-preview")
 async def file_preview(path: str, target_username: str = "", username: str = Depends(get_current_user)):
-    """Retorna o conteúdo de texto de um arquivo via Microsoft Graph (primeiros 50 KB)."""
+    """Retorna o conteúdo de um arquivo (texto, imagem ou PDF) para visualização."""
     owner = username
     if target_username and target_username != username:
         # Admin visualizando arquivo de membro — verificar permissão
@@ -745,7 +751,11 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
     if not drive_id or not item_id:
         raise HTTPException(status_code=422, detail="IDs do arquivo não disponíveis. Refaça o scan.")
 
-    MAX_BYTES = 50 * 1024
+    nome = item.get("nome") or item.get("Arquivo") or item.get("name", "")
+    ext  = ("." + nome.rsplit(".", 1)[-1].lower()) if "." in nome else ""
+    mime = _MIME_MAP.get(ext, "")
+    is_binary = bool(mime)
+    MAX_BYTES = 5 * 1024 * 1024 if is_binary else 50 * 1024
 
     # ── Google Drive ──────────────────────────────────────────────────────────
     if drive_id == "gdrive":
@@ -777,8 +787,7 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
                 raw += chunk
                 if len(raw) >= MAX_BYTES:
                     break
-            content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
-            truncated = len(raw) >= MAX_BYTES
+            raw = raw[:MAX_BYTES]
         except Exception:
             raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
 
@@ -808,15 +817,25 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
                 raw += chunk
                 if len(raw) >= MAX_BYTES:
                     break
-            content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
-            truncated = len(raw) >= MAX_BYTES
+            raw = raw[:MAX_BYTES]
         except Exception:
             raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
 
+    if is_binary:
+        import base64 as _b64
+        return {
+            "nome": nome,
+            "type": "binary",
+            "mime": mime,
+            "data": _b64.b64encode(raw).decode(),
+            "truncated": len(raw) >= MAX_BYTES,
+        }
+
     return {
-        "nome": item.get("nome") or item.get("Arquivo") or item.get("name", ""),
-        "content": content,
-        "truncated": truncated,
+        "nome": nome,
+        "type": "text",
+        "content": raw.decode("utf-8", errors="ignore"),
+        "truncated": len(raw) >= MAX_BYTES,
     }
 
 

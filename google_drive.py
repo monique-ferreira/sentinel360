@@ -17,7 +17,7 @@ from typing import Optional, Callable
 
 import requests
 
-from ms_graph import SENSITIVE_PATTERNS, SENSITIVE_FILENAMES, TEXT_EXT, MAX_FILE_BYTES, MAX_FILES_PER_SCAN
+from ms_graph import SENSITIVE_PATTERNS, SENSITIVE_FILENAMES, TEXT_EXT, ARCHIVE_EXT, MAX_FILE_BYTES, MAX_FILES_PER_SCAN
 
 DRIVE_BASE  = "https://www.googleapis.com/drive/v3"
 TOKEN_URL   = "https://oauth2.googleapis.com/token"
@@ -211,6 +211,9 @@ def _analyze_file(
         for label, pattern in SENSITIVE_PATTERNS.items():
             if re.search(pattern, content) and label not in risks:
                 risks.append(label)
+
+    if ext in ARCHIVE_EXT and "Arquivo compactado" not in risks:
+        risks.append("Arquivo compactado")
 
     if not is_inactive and not risks:
         return None

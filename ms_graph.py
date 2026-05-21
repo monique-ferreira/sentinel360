@@ -61,6 +61,10 @@ TEXT_EXT = {
     ".html", ".htm", ".php", ".rb", ".go", ".properties",
 }
 
+ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tar.gz"}
+IMAGE_EXT   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
+PDF_EXT     = {".pdf"}
+
 SENSITIVE_FILENAMES = re.compile(
     r"(?i)(password|passwd|credentials|secrets?|private[_\-]?key"
     r"|\.env|id_rsa|id_dsa|id_ecdsa|id_ed25519|\.pem|\.p12|\.pfx"
@@ -210,6 +214,10 @@ def _analyze_item(
         for label, pattern in SENSITIVE_PATTERNS.items():
             if re.search(pattern, content) and label not in risks:
                 risks.append(label)
+
+    # Arquivos compactados são sempre incluídos (conteúdo não analisável)
+    if ext in ARCHIVE_EXT and "Arquivo compactado" not in risks:
+        risks.append("Arquivo compactado")
 
     # SHA256 completo: preferir hash do Graph API (sem download extra)
     # Graph API fornece sha256Hash na propriedade file.hashes para todos os arquivos
