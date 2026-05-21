@@ -743,38 +743,75 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
     drive_id = item.get("graph_drive_id", "")
     item_id  = item.get("graph_item_id", "")
     if not drive_id or not item_id:
-        raise HTTPException(status_code=422, detail="IDs do OneDrive não disponíveis. Refaça o scan.")
+        raise HTTPException(status_code=422, detail="IDs do arquivo não disponíveis. Refaça o scan.")
 
-    cfg = database.get_integration_config(username, "ms_personal")
-    if cfg and cfg.get("access_token"):
-        access_token = cfg["access_token"]
+    MAX_BYTES = 50 * 1024
+
+    # ── Google Drive ──────────────────────────────────────────────────────────
+    if drive_id == "gdrive":
+        gdrive_cfg = database.get_integration_config(owner, "google_personal")
+        if not gdrive_cfg or not gdrive_cfg.get("access_token"):
+            raise HTTPException(status_code=400, detail="Conta Google não conectada.")
+        access_token = gdrive_cfg["access_token"]
+        # Refresh if needed
+        if gdrive_cfg.get("refresh_token"):
+            try:
+                access_token = google_drive.refresh_access_token(
+                    GCP_CLIENT_ID, GCP_CLIENT_SECRET, gdrive_cfg["refresh_token"]
+                )
+                gdrive_cfg["access_token"] = access_token
+                database.save_integration_config(owner, "google_personal", gdrive_cfg)
+            except Exception:
+                pass
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"https://www.googleapis.com/drive/v3/files/{item_id}?alt=media",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=20,
+                stream=True,
+            )
+            resp.raise_for_status()
+            raw = b""
+            for chunk in resp.iter_content(chunk_size=MAX_BYTES):
+                raw += chunk
+                if len(raw) >= MAX_BYTES:
+                    break
+            content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
+            truncated = len(raw) >= MAX_BYTES
+        except Exception:
+            raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
+
+    # ── Microsoft Graph ───────────────────────────────────────────────────────
     else:
-        cfg365 = database.get_integration_config(username, "ms365")
-        if not cfg365:
-            raise HTTPException(status_code=400, detail="Nenhuma conta Microsoft conectada.")
-        access_token = ms_graph._get_token(
-            cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"]
-        )
-
-    try:
-        import requests as _req
-        resp = _req.get(
-            f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=20,
-            stream=True,
-        )
-        resp.raise_for_status()
-        MAX_BYTES = 50 * 1024
-        raw = b""
-        for chunk in resp.iter_content(chunk_size=MAX_BYTES):
-            raw += chunk
-            if len(raw) >= MAX_BYTES:
-                break
-        content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
-        truncated = len(raw) >= MAX_BYTES
-    except Exception as e:
-        raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
+        cfg = database.get_integration_config(username, "ms_personal")
+        if cfg and cfg.get("access_token"):
+            access_token = cfg["access_token"]
+        else:
+            cfg365 = database.get_integration_config(username, "ms365")
+            if not cfg365:
+                raise HTTPException(status_code=400, detail="Nenhuma conta Microsoft conectada.")
+            access_token = ms_graph._get_token(
+                cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"]
+            )
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=20,
+                stream=True,
+            )
+            resp.raise_for_status()
+            raw = b""
+            for chunk in resp.iter_content(chunk_size=MAX_BYTES):
+                raw += chunk
+                if len(raw) >= MAX_BYTES:
+                    break
+            content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
+            truncated = len(raw) >= MAX_BYTES
+        except Exception:
+            raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
 
     return {
         "nome": item.get("nome") or item.get("Arquivo") or item.get("name", ""),
