@@ -49,7 +49,7 @@ import bi_excel
 MS_CLIENT_ID     = os.environ.get("MS_CLIENT_ID", "")
 MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
 MS_REDIRECT_URI  = os.environ.get("MS_REDIRECT_URI", "https://sentinel360-cyber.vercel.app/integrations")
-MS_SCOPES        = "Files.Read Sites.Read.All User.Read offline_access"
+MS_SCOPES        = "Files.ReadWrite Sites.ReadWrite.All User.Read offline_access"
 FRONTEND_URL     = os.environ.get("FRONTEND_URL", "https://sentinel360-cyber.vercel.app")
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
@@ -389,6 +389,45 @@ async def forgot_password(body: ForgotPasswordBody):
 @app.get("/results")
 def get_results(username: str = Depends(get_current_user)):
     return {"items": database.get_cloud_results(owner=username)}
+
+
+@app.delete("/delete-item")
+async def delete_item(
+    path: str,
+    from_cloud: bool = False,
+    username: str = Depends(get_current_user),
+):
+    """Remove item dos resultados do Sentinel e, opcionalmente, do OneDrive/SharePoint."""
+    # Find the item in DB to get graph IDs
+    if from_cloud:
+        all_items = database.get_cloud_results(owner=username)
+        item = next((i for i in all_items if (i.get("caminho") or i.get("Caminho") or i.get("path")) == path), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Item não encontrado nos resultados.")
+        drive_id = item.get("graph_drive_id", "")
+        item_id  = item.get("graph_item_id", "")
+        if not drive_id or not item_id:
+            raise HTTPException(status_code=422, detail="IDs do OneDrive não disponíveis para este item. Refaça o scan para obter os IDs.")
+
+        # Get access token (personal delegated or corporate app token)
+        cfg = database.get_integration_config(username, "ms_personal")
+        if cfg and cfg.get("access_token"):
+            access_token = cfg["access_token"]
+        else:
+            # Try corporate MS365 credentials
+            cfg365 = database.get_integration_config(username, "ms365")
+            if not cfg365:
+                raise HTTPException(status_code=400, detail="Nenhuma conta Microsoft conectada.")
+            access_token = ms_graph._get_token(
+                cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"]
+            )
+        try:
+            ms_graph.delete_drive_item(access_token, drive_id, item_id)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Falha ao deletar no OneDrive: {e}")
+
+    database.delete_cloud_result(owner=username, caminho=path)
+    return {"deleted": True}
 
 
 @app.get("/export/csv")

@@ -209,6 +209,8 @@ def _analyze_item(
         "last_scan":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "dias_sem_acesso": days_ago,
         "ultimo_acesso":   last_accessed[:10] if last_accessed else "",
+        "graph_item_id":   item.get("id", ""),
+        "graph_drive_id":  item.get("parentReference", {}).get("driveId", ""),
     }
 
 
@@ -390,6 +392,21 @@ def scan_onedrive_personal(access_token: str, days_threshold: int = 180, progres
         print(f"[GRAPH] Erro ao varrer OneDrive pessoal: {e}")
     print(f"[GRAPH] OneDrive pessoal: {len(results)} itens relevantes de {counter[0]} arquivos.")
     return results
+
+
+# ── Deleção de arquivo via Graph API ─────────────────────────────────────────
+
+def delete_drive_item(access_token: str, drive_id: str, item_id: str) -> None:
+    """
+    Deleta um arquivo do OneDrive/SharePoint via Graph API.
+    Requer scope Files.ReadWrite (personal) ou Files.ReadWrite.All (corporativo).
+    Lança exceção se falhar.
+    """
+    import requests as _req
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}"
+    resp = _req.delete(url, headers={"Authorization": f"Bearer {access_token}"})
+    if resp.status_code not in (200, 204):
+        raise Exception(f"Graph API retornou {resp.status_code}: {resp.text[:200]}")
 
 
 # ── Auditoria de usuários ─────────────────────────────────────────────────────
