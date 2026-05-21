@@ -1,7 +1,45 @@
+import base64
 import os
 import certifi
 from pymongo import MongoClient
 from datetime import datetime
+
+# ── Field-level encryption for sensitive integration credentials ──────────────
+# Requires ENCRYPTION_KEY env var (32 url-safe base64 bytes, generate with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+_ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
+_fernet = None
+if _ENCRYPTION_KEY:
+    try:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(_ENCRYPTION_KEY.encode())
+    except Exception as _e:
+        print(f"[WARN DB] Fernet init failed: {_e} — credentials will be stored unencrypted")
+
+_ENCRYPTED_FIELDS = {"client_secret", "access_token", "refresh_token"}
+
+
+def _encrypt(value: str) -> str:
+    if _fernet and isinstance(value, str):
+        return "enc:" + _fernet.encrypt(value.encode()).decode()
+    return value
+
+
+def _decrypt(value: str) -> str:
+    if _fernet and isinstance(value, str) and value.startswith("enc:"):
+        return _fernet.decrypt(value[4:].encode()).decode()
+    return value
+
+
+def _encrypt_config(config: dict) -> dict:
+    return {k: (_encrypt(v) if k in _ENCRYPTED_FIELDS else v) for k, v in config.items()}
+
+
+def _decrypt_config(config: dict) -> dict:
+    if not config:
+        return config
+    return {k: (_decrypt(v) if k in _ENCRYPTED_FIELDS and isinstance(v, str) else v)
+            for k, v in config.items()}
 
 MONGO_URI = os.environ.get("MONGO_URI")
 
@@ -136,9 +174,10 @@ def create_user(user_data: dict) -> bool:
 
 def save_integration_config(owner: str, provider: str, config: dict) -> bool:
     try:
+        encrypted = _encrypt_config(config)
         _col("integration_configs").update_one(
             {"owner": owner, "provider": provider},
-            {"$set": {**config, "owner": owner, "provider": provider,
+            {"$set": {**encrypted, "owner": owner, "provider": provider,
                       "updated_at": datetime.now().isoformat()}},
             upsert=True,
         )
@@ -150,9 +189,10 @@ def save_integration_config(owner: str, provider: str, config: dict) -> bool:
 
 def get_integration_config(owner: str, provider: str) -> dict | None:
     try:
-        return _col("integration_configs").find_one(
+        doc = _col("integration_configs").find_one(
             {"owner": owner, "provider": provider}, {"_id": 0}
         )
+        return _decrypt_config(doc)
     except Exception as e:
         print(f"[ERRO DB] get_integration_config: {e}")
         return None
@@ -220,6 +260,7 @@ def get_org_by_id(org_id: str) -> dict | None:
 def search_orgs(query: str) -> list[dict]:
     try:
         import re
+        query = query[:50]  # cap length to prevent ReDoS
         pattern = re.compile(re.escape(query), re.IGNORECASE)
         orgs = list(_col("organizations").find(
             {"$or": [{"name": pattern}, {"slug": pattern}]},

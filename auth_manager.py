@@ -3,9 +3,11 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "SENTINEL_360_SUPER_SECRET_KEY_AWS_2026")
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set. Refusing to start.")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 12
+ACCESS_TOKEN_EXPIRE_HOURS = 2
 
 pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 

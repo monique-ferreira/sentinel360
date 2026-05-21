@@ -23,8 +23,11 @@ Endpoints:
 """
 
 import csv
+import hashlib
+import hmac
 import io
 import os
+import secrets
 import threading
 import time
 import urllib.parse
@@ -57,16 +60,17 @@ VT_API_KEY       = os.environ.get("VT_API_KEY", "")
 
 app = FastAPI(title="Sentinel360 API", version="2.1.0")
 
+_DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+_ALLOWED_ORIGINS = ["https://sentinel360-cyber.vercel.app"]
+if _DEBUG:
+    _ALLOWED_ORIGINS += ["http://localhost:5173", "http://localhost:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://sentinel360-cyber.vercel.app",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # ── Modelos ───────────────────────────────────────────────────────────────────
@@ -159,6 +163,50 @@ class CloudScanState:
 
 
 _scan_states: dict[str, CloudScanState] = {}
+
+# ── Simple rate limiter for login ─────────────────────────────────────────────
+# Tracks failed attempts per key (username or IP); locks out after MAX_ATTEMPTS
+_login_attempts: dict[str, list[float]] = {}
+_LOGIN_WINDOW   = 300   # 5 minutes
+_MAX_ATTEMPTS   = 10
+
+
+def _check_login_rate(key: str):
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(key, []) if now - t < _LOGIN_WINDOW]
+    if len(attempts) >= _MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Muitas tentativas de login. Aguarde 5 minutos.")
+    attempts.append(now)
+    _login_attempts[key] = attempts
+
+
+def _clear_login_rate(key: str):
+    _login_attempts.pop(key, None)
+
+# OAuth state nonces: {nonce: (username, expires_at)}
+_oauth_states: dict[str, tuple[str, float]] = {}
+_OAUTH_STATE_TTL = 600  # 10 minutes
+
+
+def _create_oauth_state(username: str) -> str:
+    nonce = secrets.token_urlsafe(32)
+    _oauth_states[nonce] = (username, time.time() + _OAUTH_STATE_TTL)
+    # Prune expired entries
+    expired = [k for k, (_, exp) in _oauth_states.items() if time.time() > exp]
+    for k in expired:
+        _oauth_states.pop(k, None)
+    return nonce
+
+
+def _consume_oauth_state(nonce: str) -> str | None:
+    """Returns the username bound to this nonce, or None if invalid/expired."""
+    entry = _oauth_states.pop(nonce, None)
+    if not entry:
+        return None
+    username, expires_at = entry
+    if time.time() > expires_at:
+        return None
+    return username
 
 
 def _get_scan_state(username: str) -> CloudScanState:
@@ -475,11 +523,17 @@ async def workspace_bi_report(username: str = Depends(get_current_user), target_
 
 
 @app.post("/login")
-async def login(body: LoginBody):
+async def login(body: LoginBody, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    _check_login_rate(f"ip:{ip}")
+    _check_login_rate(f"user:{body.username}")
+
     user = database.find_user(body.username)
     if not user or not auth_manager.verify_password(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
 
+    _clear_login_rate(f"ip:{ip}")
+    _clear_login_rate(f"user:{body.username}")
     token = auth_manager.create_access_token({"sub": body.username})
     database.log_action("LOGIN", f"Usuário autenticado: {body.username}", owner=body.username)
     return {"access_token": token, "token_type": "bearer"}
@@ -589,7 +643,7 @@ async def file_preview(path: str, target_username: str = "", username: str = Dep
         content = raw[:MAX_BYTES].decode("utf-8", errors="ignore")
         truncated = len(raw) >= MAX_BYTES
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao ler o arquivo: {e}")
+        raise HTTPException(status_code=502, detail="Não foi possível ler o arquivo. Tente novamente.")
 
     return {
         "nome": item.get("nome") or item.get("Arquivo") or item.get("name", ""),
@@ -634,8 +688,8 @@ async def virustotal_check(path: str, target_username: str = "", username: str =
             headers={"x-apikey": VT_API_KEY},
             timeout=15,
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao contatar VirusTotal: {e}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Não foi possível contatar o VirusTotal. Tente novamente.")
 
     if resp.status_code == 404:
         result = {"status": "not_found", "sha256": sha256}
@@ -859,13 +913,14 @@ def azure_file_results(username: str = Depends(get_current_user)):
 
 @app.get("/auth/microsoft/login")
 async def microsoft_login(username: str = Depends(get_current_user)):
+    state_nonce = _create_oauth_state(username)
     params = urllib.parse.urlencode({
         "client_id":     MS_CLIENT_ID,
         "response_type": "code",
         "redirect_uri":  MS_REDIRECT_URI,
         "scope":         MS_SCOPES,
         "response_mode": "query",
-        "state":         username,
+        "state":         state_nonce,
         "prompt":        "select_account",
     })
     url = f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?{params}"
@@ -873,7 +928,12 @@ async def microsoft_login(username: str = Depends(get_current_user)):
 
 
 @app.post("/auth/microsoft/exchange")
-async def microsoft_exchange(body: MsExchangeBody):
+async def microsoft_exchange(body: MsExchangeBody, username: str = Depends(get_current_user)):
+    # Validate nonce — must match the authenticated user who initiated the flow
+    nonce_owner = _consume_oauth_state(body.state)
+    if not nonce_owner or nonce_owner != username:
+        raise HTTPException(status_code=400, detail="Estado OAuth inválido ou expirado.")
+
     resp = req.post(
         "https://login.microsoftonline.com/common/oauth2/v2.0/token",
         data={
@@ -900,15 +960,14 @@ async def microsoft_exchange(body: MsExchangeBody):
     ms_email = me.get("mail") or me.get("userPrincipalName", "")
     ms_name  = me.get("displayName", "")
 
-    owner = body.state or "unknown"
-    database.save_integration_config(owner, "ms_personal", {
+    database.save_integration_config(username, "ms_personal", {
         "type":          "delegated",
         "access_token":  access_token,
         "refresh_token": refresh_token,
         "ms_email":      ms_email,
         "ms_name":       ms_name,
     })
-    database.log_action("OAUTH_MS", f"Conta pessoal conectada: {ms_email}", owner=owner)
+    database.log_action("OAUTH_MS", f"Conta pessoal conectada: {ms_email}", owner=username)
     return {"connected": True, "ms_email": ms_email, "ms_name": ms_name}
 
 
@@ -949,16 +1008,20 @@ async def microsoft_callback(request: Request):
     ms_email = me.get("mail") or me.get("userPrincipalName", "")
     ms_name  = me.get("displayName", "")
 
-    owner = state or "unknown"
-    database.save_integration_config(owner, "ms_personal", {
+    nonce_owner = _consume_oauth_state(state)
+    if not nonce_owner:
+        return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_error=invalid_state")
+
+    database.save_integration_config(nonce_owner, "ms_personal", {
         "type":          "delegated",
         "access_token":  access_token,
         "refresh_token": refresh_token,
         "ms_email":      ms_email,
         "ms_name":       ms_name,
     })
-    database.log_action("OAUTH_MS", f"Conta pessoal conectada: {ms_email}", owner=owner)
-    return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_connected=1&ms_email={ms_email}")
+    database.log_action("OAUTH_MS", f"Conta pessoal conectada: {ms_email}", owner=nonce_owner)
+    # Don't echo email in redirect URL — frontend fetches it via /auth/microsoft/status
+    return RedirectResponse(f"{FRONTEND_URL}/integrations?ms_connected=1")
 
 
 @app.get("/auth/microsoft/status")
