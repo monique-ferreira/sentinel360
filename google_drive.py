@@ -101,6 +101,19 @@ def _headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def delete_drive_file(token: str, file_id: str) -> None:
+    """Exclui permanentemente um arquivo do Google Drive pelo file_id."""
+    resp = requests.delete(
+        f"{DRIVE_BASE}/files/{file_id}",
+        headers=_headers(token),
+        params={"supportsAllDrives": True},
+        timeout=15,
+    )
+    if resp.status_code == 404:
+        raise FileNotFoundError("Arquivo não encontrado no Google Drive.")
+    resp.raise_for_status()
+
+
 def _drive_get_all(token: str, url: str, params: dict) -> list[dict]:
     """Pagina sobre todos os resultados de uma query do Drive API."""
     results = []

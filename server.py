@@ -706,25 +706,41 @@ async def delete_item(
             raise HTTPException(status_code=404, detail="Item não encontrado nos resultados.")
         drive_id = item.get("graph_drive_id", "")
         item_id  = item.get("graph_item_id", "")
-        if not drive_id or not item_id:
-            raise HTTPException(status_code=422, detail="IDs do OneDrive não disponíveis para este item. Refaça o scan para obter os IDs.")
+        if not item_id:
+            raise HTTPException(status_code=422, detail="ID do arquivo não disponível. Refaça o scan para obter os IDs.")
 
-        # Get access token (personal delegated or corporate app token)
-        cfg = database.get_integration_config(username, "ms_personal")
-        if cfg and cfg.get("access_token"):
-            access_token = cfg["access_token"]
+        if drive_id == "gdrive":
+            # Google Drive deletion
+            cfg_gdrive = database.get_integration_config(username, "gdrive_personal")
+            if not cfg_gdrive:
+                raise HTTPException(status_code=400, detail="Conta Google Drive não conectada.")
+            access_token = cfg_gdrive.get("access_token", "")
+            if not access_token:
+                raise HTTPException(status_code=400, detail="Token Google Drive expirado. Reconecte a conta.")
+            try:
+                google_drive.delete_drive_file(access_token, item_id)
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail="Arquivo não encontrado no Google Drive.")
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Falha ao deletar no Google Drive: {e}")
         else:
-            # Try corporate MS365 credentials
-            cfg365 = database.get_integration_config(username, "ms365")
-            if not cfg365:
-                raise HTTPException(status_code=400, detail="Nenhuma conta Microsoft conectada.")
-            access_token = ms_graph._get_token(
-                cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"]
-            )
-        try:
-            ms_graph.delete_drive_item(access_token, drive_id, item_id)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Falha ao deletar no OneDrive: {e}")
+            # Microsoft OneDrive / SharePoint deletion
+            if not drive_id:
+                raise HTTPException(status_code=422, detail="IDs do OneDrive não disponíveis para este item. Refaça o scan para obter os IDs.")
+            cfg = database.get_integration_config(username, "ms_personal")
+            if cfg and cfg.get("access_token"):
+                access_token = cfg["access_token"]
+            else:
+                cfg365 = database.get_integration_config(username, "ms365")
+                if not cfg365:
+                    raise HTTPException(status_code=400, detail="Nenhuma conta Microsoft conectada.")
+                access_token = ms_graph._get_token(
+                    cfg365["tenant_id"], cfg365["client_id"], cfg365["client_secret"]
+                )
+            try:
+                ms_graph.delete_drive_item(access_token, drive_id, item_id)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Falha ao deletar no OneDrive: {e}")
 
     database.delete_cloud_result(owner=username, caminho=path)
     return {"deleted": True}
